@@ -1,0 +1,35 @@
+[Unit]
+Description=Halogen Qwen3.8-27B Dense inference server
+ConditionPathIsMountPoint=/srv/llm
+
+[Container]
+Image=ghcr.io/peonist-ai/halogen:0.1.4
+Pull=never
+ContainerName=halogen-dense
+Label=io.evox2.halogen.service=halogen-active
+Volume=/srv/llm/models/halogen-dense:/models:ro
+Volume=/srv/llm/models/halogen-dense/tokenizer:/tokenizer:ro
+Environment=HALOGEN_CHECKPOINT=/models/qwen3.8-27b-p1w4d-d2.hgn
+Environment=HALOGEN_TOKENIZER=/tokenizer
+PublishPort=0.0.0.0:8732:8731
+AddDevice=/dev/kfd
+AddDevice=/dev/dri
+GroupAdd=keep-groups
+Ulimit=memlock=-1:-1
+PodmanArgs=--security-opt seccomp=unconfined --ipc=host
+
+[Service]
+Restart=no
+LimitMEMLOCK=infinity
+ExecStartPre=/usr/bin/test -d /srv/llm/containers/podman
+ExecStartPre=/usr/bin/bash -ec 'for file in qwen3.8-27b-p1w4d-d2.hgn tokenizer/tokenizer.json tokenizer/tokenizer_config.json tokenizer/chat_template.jinja; do test -r "/srv/llm/models/halogen-dense/$$file"; test -s "/srv/llm/models/halogen-dense/$$file"; done'
+ExecStartPre=/usr/bin/bash -ec 'for node in /dev/kfd /dev/dri/renderD*; do test -r "$$node"; test -w "$$node"; done'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(id -u)" -ne 0; test "$$(ulimit -S -l)" = unlimited; test "$$(ulimit -H -l)" = unlimited'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(/usr/bin/podman info --format "{{.Host.Security.Rootless}}")" = true'
+ExecStartPre=/usr/bin/podman image exists ghcr.io/peonist-ai/halogen:0.1.4
+# Refuse any existing model container before Quadlet's generated --replace.
+ExecStartPre=/usr/bin/bash -ec 'existing=$$(/usr/bin/podman ps -a --filter "name=^(halogen-flash|halogen-dense|halogen-dense-bootstrap)$$" --format "{{.Names}}"); test -z "$$existing"'
+ExecStartPre=/usr/bin/bash -ec 'listeners=$$(/usr/bin/ss -H -ltn "sport = :8732"); test -z "$$listeners"'
+
+[Install]
+WantedBy=default.target
