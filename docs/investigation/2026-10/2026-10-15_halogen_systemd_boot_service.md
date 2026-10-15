@@ -1,5 +1,7 @@
 # Halogen Flash-Next 常駐化・OS起動時自動起動 実施レポート
 
+> **最新状態: `PASS / RUNNING`（2026-10-15 再開追補）。** 更新指示書commit `88dfed241f2042c975f9c3b208536246c8409eb5` に従い、QuadletとHalogen専用停止drop-inを配置した。正常停止・GTT解放、SSH切断耐性、OS再起動1回後のログイン前自動起動、Thinking ON APIを実証した。最終状態は `active/running`、Linger=yes、Restart=no。詳細は **第9節以降**。第1～8節は前回の停止調査の履歴であり、当時の未実施・要承認の記載を保持している。親ユーザーマネージャーを変更する旧提案は採用していない。
+
 ## 1. 結果
 
 **状態: `BLOCKED_SAFE_STOP_DESIGN`。常駐化は未完了。** Podman 5.7.0のQuadlet停止設定について、承認済み指示書が求める `--time=-1` 相当の安全な停止を標準の `StopTimeout` では実現できないことを実機で確認した。指示書A1の「未対応の場合は安全な代替設計を提示して停止する」に従い、代替設定の適用・Halogen起動・Ubuntu再起動には進んでいない。
@@ -155,3 +157,152 @@ Quadlet採用・単一activeサービスという設計は維持し、**生成se
 - [Podman v5.7.0 Quadlet実装](https://github.com/containers/podman/blob/v5.7.0/pkg/systemd/quadlet/quadlet.go)。StopTimeoutがrunのstop-timeoutへ渡され、ExecStop/ExecStopPostにrm -fが追加される実装を実機dry-runと照合。
 - [Podman stop公式仕様](https://docs.podman.io/en/latest/markdown/podman-stop.1.html)。stopのtime=-1は無限待機であり、runの符号なしstop-timeoutとは区別する。
 - [Ubuntu user manager仕様](https://manpages.ubuntu.com/manpages/resolute/man5/systemd-user-runtime-dir.5.html)。実効limit・停止期限は当該ホストのunit/proc/PAMも照合した。
+
+## 9. 再開追補: 実施条件と採用構成
+
+### 9.1 受領・最小限の再確認
+
+- 実施日: 2026-10-15、13:31～13:40 JSTに実機検証。その後レポート追補・Git反映。実行主体はWindows開発PC上のCodex、実機操作は `ssh evox2` 経由のEVO-X2 Ubuntu。公開レポートへ実ユーザー名、UID、LAN情報、UUID、認証情報は保存しない。
+- 指示書pathは第2節と同じ。今回実行した版は **`88dfed241f2042c975f9c3b208536246c8409eb5`**。前回レポートcommitは `cff21e783898e14b6622c5619c58426fad3e4beb`。
+- Windows側開始branch=`main`、開始HEAD=`cff21e783898e14b6622c5619c58426fad3e4beb`、作業ツリーclean。他タスク変更なし。`AGENTS.md` を先に読み、fetch・ancestor検査後に更新指示書commitへfast-forwardした。更新指示書、前回停止調査、初回導入成功レポート、既存run.shを確認した。
+- SSH/sudo、実OS・アカウント、既存mount、rootless Podman/cgroup v2、image識別、モデルの存在・size、GPU権限、manager実効memlock、ポート・コンテナ競合なしだけを再確認した。モデルの110 GiB再hash、再取得、ディスク全面調査は行っていない。
+- 開始時は既報と同じUbuntu 26.04.1 / kernel `7.0.0-38-generic`、Linger=no、Halogen停止、GTT=18,661,376 bytes。配置対象2ファイルがないことを確認してから作成した。
+- 親 `user@<UID>.service` は前回どおり `TimeoutStopUSec=5s / KillMode=mixed / SendSIGKILL=yes`。実managerのMax locked memoryはsoft/hardともunlimited。親設定、PAM、limits.dへの変更やmanager restartは行っていない。
+
+### 9.2 配置した2ファイル
+
+| tracked正本 | 実機配置（対象rootlessユーザー） | SHA-256（Windows・実機・boot後で一致） |
+|---|---|---|
+| `deploy/halogen-flash/halogen-active.container` | `~/.config/containers/systemd/halogen-active.container` | `49723c646d114b70e15f33eaacbcdcf5c10c9c7375aac6620da3265201b13f2b` |
+| `deploy/halogen-flash/halogen-active.service.d/90-safe-stop.conf` | `~/.config/systemd/user/halogen-active.service.d/90-safe-stop.conf` | `790f8cc28a2c035c32a9436745bd946f00dc2ea9c088d5c5851cbface958605e` |
+
+停止drop-inを先に配置し、Quadlet配置後に `systemctl --user daemon-reload`。両ファイルmode=0644。必要な親ディレクトリだけを作成した。対象ユーザーだけ `sudo -n loginctl enable-linger <対象ユーザー>` を実行し、Linger=yesと永続lingerファイルを確認した。
+
+構成は固定image `ghcr.io/peonist-ai/halogen-flash-server:0.18.4` / Pull=never、container名 `halogen-flash`、既存モデルディレクトリを `/models:ro`、checkpoint=`/models/qwen38-flash-next-v2.hgn`、HALOGEN_DOWNLOAD未設定。image IDは `556c3c8179d8a566cc0ec0a7f7f54f9f3cb8b77e7bc4a4175e7c23ae359ad80a`、digestは `sha256:1a458cd6decdd3a2c27f96196cc3a0bc853cbb3905320c3461d29137072faa78` で初回導入時と一致する。今回のネットワーク取得はない。Podman journalにはローカルimage選択時にも `image pull` というイベント名が出たが、生成ExecStartは `--pull never` で既存IDを使用している。
+
+`/dev/kfd`・`/dev/dri`、keep-groups、IPC=host、memlock=-1:-1を指定し、ホスト公開は **127.0.0.1:8731のみ**。コンテナ内の0.0.0.0:8731というAPIログをホストのLAN公開と混同しない。inspectでROモデルmountとloopbackのPortBindings、実際の `ss` でもloopback bindを確認した。
+
+mountpoint、既存graphrootディレクトリ、v2/ngram/tokenizerの可読・非空、GPUデバイスのread/write、非root/rootless、soft/hard memlock、既存image、同名コンテナなし、8731未使用を起動前に確認する。`ConditionPathIsMountPoint=/srv/llm` により未mount時は起動しない。generatorの `--replace` より先に同名の稼働中・停止済みコンテナを拒否する。
+
+### 9.3 生成unitと停止経路
+
+生成unitはType=notify / NotifyAccess=all、MainPIDはconmon、engineは同サービス配下のcontainer cgroupに入る。ExecStartの主要引数は以下であり、不正な `--stop-timeout -1` は含まない。
+
+```text
+podman run --name halogen-flash --replace --rm --cgroups=split --pull never
+  --ulimit memlock=-1:-1 --group-add keep-groups --sdnotify=conmon -d
+  --device /dev/kfd --device /dev/dri
+  -v /srv/llm/models/halogen-flash:/models:ro
+  --publish 127.0.0.1:8731:8731
+  --env HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2.hgn
+  --label io.evox2.halogen.service=halogen-active --ipc=host
+  ghcr.io/peonist-ai/halogen-flash-server:0.18.4
+```
+
+drop-in適用後の **実効値** は以下。generator本体に残る `podman rm -v -f -i` は、空のExecStop/ExecStopPostによるリセットで両方とも上書きされ、実効停止経路には存在しない。
+
+```ini
+ExecStop=/usr/bin/podman stop --ignore --time=-1 halogen-flash
+ExecStopPost=-/usr/bin/podman rm --ignore --filter label=io.evox2.halogen.service=halogen-active --filter name=^halogen-flash$$
+TimeoutStopSec=infinity
+Restart=no
+KillMode=mixed
+SendSIGKILL=no
+LimitMEMLOCK=infinity
+```
+
+`$$` はsystemdから実行時に渡すリテラル `$` の表記。ExecStopPostはサービス所有ラベルと完全一致名の両条件を持つ停止済みコンテナだけを非強制削除する。指示書の基本形を、この所有範囲の限定だけ補強した。`--rm` で消滅済みの場合も正常終了する。
+
+既存保護の確認には、既存imageからGPU・モデルなし、network=none、entrypoint=/bin/trueの同名・ラベルなしコンテナを **createだけ** 実行し、起動していない。同名検出の終了コード1を確認し、同じ後処理のlabel/name filterを実行してもID・created状態が維持された。検証用に作った当該IDだけを非強制rmで片付けた。Halogenへの障害注入・強制停止は行っていない。
+
+`systemctl --user cat/show` と `systemd-analyze --user --generators=true verify halogen-active.service` はPASS。最初のverifyでgeneratorsを有効にせず「Unit not found」となったが、適切なオプションで検証成功した。実サービスのLoadStateはloadedで、起動失敗ではない。
+
+`[Install] WantedBy=default.target` により、runtimeの `systemd/generator/default.target.wants/halogen-active.service -> ../halogen-active.service` が生成され、default.targetのWantsにも含まれた。UnitFileState=generatedであり、`systemctl --user enable` は実行していない。boot後にも同じリンクを確認した。
+
+## 10. 再開追補: 起動・停止・再起動の実測
+
+### 10.1 systemd起動とSSH切断
+
+13:35:28 JSTに `systemctl --user start halogen-active.service` が成功。MainPID=conmonでactive/running、containerはrunning。初回warmロードはweights pin 0.7秒、engine内部のmodel ready 2.5秒、engine listening after 4秒。`/health`・`/v1/models` はHTTP 200、engine.responds=true、モデルID一致、Thinking control probe passedだった。
+
+前回と同じcontext=262144、slots=4、KV pool=524288、MTP depth-2、prompt cache mode=2。image・checkpoint・chat template hashは既存値を維持。API/engineとも0.18.4。vision未ロード、独自watchdog追加なし。イメージに元から含まれるwatchdogは既存のまま。
+
+操作SSHを閉じた13:36:02から新規接続13:36:43まで、同一container IDとMainPID・起動時刻を維持し、healthはok、NRestarts=0。セッション確認では操作中のsshdセッション以外はsystemd-userのmanagerセッションだけだった。正常停止検証後も13:37:06にstartし直してSSHを終了、13:37:49の新規接続で同一コンテナ・readyを確認した。最後のSSH終了に伴ってengineが終了する既往事象は再発しなかった。
+
+### 10.2 正常停止とGPU解放
+
+いずれも直前のhealthがbusy=false / in_flight=0 / queued=0であることを確認し、**systemctl経由**で停止した。
+
+| 機会（JST） | 停止前GTT bytes | stopのwall秒 | 停止後GTT bytes | 結果 |
+|---|---:|---:|---:|---|
+| 13:36:45～46、最初の正常停止検証 | 29,085,544,448 | 1.179 | 18,661,376 | PASS |
+| 13:37:50～51、計画再起動の直前停止 | 29,054,521,344 | 1.189 | 18,661,376 | PASS |
+
+両方ともsystemdのResult=success、ExecMainStatus=0、ExecStop/ExecStopPostのstatus=0、inactive/dead、コンテナ一覧空、8731 listenなし、NRestarts=0。journalの `stop requested; shutting down`、engine/APIの正常終了、`GTT in use after the engine exited: 0.0 GiB`、Stoppedを照合した。実行済みExecStopは `podman stop --ignore --time=-1` であり、強制kill・force rmは実行していない。GTTは開始時の18,661,376 bytesに完全に戻った。
+
+### 10.3 1回のOS再起動とログイン前自動起動
+
+既存efibootmgrでBootCurrent=Ubuntu、BootOrder先頭=同Ubuntu、BootNextなしを再確認した。GRUB_DEFAULT=0、最初のmenuentry=Ubuntu、grubenvは空。UEFI/GRUBに変更していない。
+
+第10.2節の2回目停止の後、停止状態・ポート消失・GTT一致・Linger=yesの永続ファイル・default.target登録を確認し、**13:38:00 JSTに `sudo -n reboot` を1回だけ**実行した。Halogenの停止を親managerの5秒期限に委ねていない。Windowsや別ホストへの再起動はない。
+
+再起動後は `start` を一切実行せず、新規SSHで次の証拠を得た。
+
+| 事象 | bootからの時刻（秒） | 証拠 |
+|---|---:|---|
+| Halogenサービス開始処理 | 6.101 | user journal |
+| サービスactive | 6.597 | ActiveEnterTimestampMonotonic・journal |
+| weights pin完了 | 45.350 | 62.11 GiB、pin処理34.8秒、1.9 GB/s |
+| model ready | 47.407 | engine内部経過36.8秒 |
+| API startup complete / listen | 49.733 | user journal |
+| 再起動後最初のSSHログイン | 62.015 | 当該sshdセッションのTimestampMonotonic |
+
+最初のSSHは13:39:12 JSTで、サービスは13:38:16から既に稼働。boot時刻の変化も確認した。**API起動完了はSSHログインより約12.3秒早い**。service activeだけでreadyと判断せず、最初の接続から `/health`・`/v1/models` がHTTP 200であることも確認した。coldロードは最初のwarmロードより長いが、起動失敗・restart loopはない。
+
+boot後の実ユーザーマネージャープロセス、コンテナPID 1、実 `flash_serve` プロセスのMax locked memoryはsoft/hardともunlimited。service LimitMEMLOCK=infinity、GPUデバイスのread/write可。既存limits.d規則がログイン前のmanager・コンテナへ継承された。親managerの停止期限5秒・KillMode・SendSIGKILL・vendor drop-in一覧も変更前と同じだった。
+
+起動後GTT=29,054,521,344 bytes、MemTotal=127,102,676 kB（約121.21 GiB）、観測時MemAvailable=95,607,680 kB、swap使用0。MemAvailableはGPUにpinされたweightsを過大評価する既知の表示で、約91 GiBを実用空き容量とは扱わない。engineの内訳はweights 62.1 GiB、KV 14.4 GiB、work 12.5 GiB、合計89.0 GiB、ngram 47.7 GiBはfile cache経由のまま。
+
+boot後kernel journalをOOM/kill・GPU error/fault/reset/timeout/hangの語境界付きパターンで限定確認し、該当0。最初の広いパターンが通常のTMZ disabled `(default)` 行の `fault` 部分へ誤一致したため、語境界付きで確認した。コンテナOOMKilled=false。既知のFastAPI on_event DeprecationWarningは出るがAPIは正常であり、今回修正対象にしていない。この短い確認は全障害の不存在を保証するものではない。
+
+### 10.4 Thinking ON API・Windowsからの疎通
+
+**[EVO-X2 Ubuntu/SSH]** Python標準HTTP clientで逐次2問だけ検証。model=`halogen-qwen3.8-flash-next`、enable_thinking=true、reasoning_effort=low、temperature=0、max_completion_tokens=4096、stream=false、seed/top_p/top_kは未指定。既存構成のMTPを使用した。2問ともHTTP 200 / finish_reason=stop、非空reasoning_contentと正しい日本語最終回答を確認した。思考本文は保存しない。
+
+| 機会・短問 | 最終回答 | input / completion（reasoning）tokens | pp tok/s | tg tok/s | prompt / generation ms | HTTP wall秒 |
+|---|---|---:|---:|---:|---:|---:|
+| 初回systemd起動後、12人の握手 | 66回、組合せの説明 | 67 / 142（91） | 165.187 | 74.043 | 405.6 / 1917.8 | 2.358 |
+| OS再起動後、りんご17個を5人に配る | 一人3個、余り2個 | 74 / 68（56） | 167.686 | 65.815 | 441.3 / 1033.2 | 1.510 |
+
+reasoning_contentは274/180文字。MTP draft/acceptedは125/96と55/43、cache_n=0。tgはThinkingを含むcompletion全体のserver predicted_per_second、wallはclientの全応答受信まで。非streamなのでTTFTは未測定。短い日本語計算2件・low/greedyの疎通確認であり、xhigh/長文の品質・持続速度やWindows実測との厳密比較を主張しない。
+
+**[Windows開発PC]** 30秒で自然終了するSSHを `-L 127.0.0.1:18731:127.0.0.1:8731` 付きで開き、Invoke-RestMethodからhealth/models正常応答を確認。転送は自然終了済み、Windowsの18731 listenなし。再起動後も全操作SSH・一時転送が終了した後の13:40:33の新規接続で同じboot後container・起動時刻を維持し、active/running、NRestarts=0、health ok/idleを確認した。確認SSHも終了し、サービスを稼働させたまま残した。
+
+## 11. 再開追補: 判定・運用・切戻し・Git
+
+| 項目 | 今回の判定 |
+|---|---|
+| Quadletと専用停止drop-inの生成・実効値・ファイル一致 | PASS |
+| 既存image/model再利用、rootless、GPU、RO mount、loopback公開 | PASS |
+| 同名コンテナ拒否と無関係コンテナを削除しない後処理 | PASS（非GPUのcreateのみの小規模確認） |
+| systemd起動・正常停止検知・GTT解放 | PASS（正常停止2回、再起動直前を含む） |
+| SSH切断耐性・linger永続化 | PASS（再起動前後で確認） |
+| Ubuntu再起動後のログイン前自動起動 | PASS（計画再起動1回、boot後の手動startなし） |
+| memlock継承・boot後の実engine無制限 | PASS |
+| health/models・Thinking ON日本語・Windows SSH転送 | PASS |
+| 最終稼働 | PASS: active/running、Linger=yes、Restart=no、NRestarts=0 |
+| 今回の機能検証FAIL | なし。前回StopTimeout=-1互換性FAILは履歴として保持 |
+| 突然のOS shutdown、異常停止・GPU hang、失敗注入、強制kill | 未実施・保証対象外 |
+| 長文/長context、画像、tool calls、耐久、MTP品質比較、Dense切替 | 未実施・今回対象外 |
+
+**残る運用上の制約:** 子サービスの停止は無期限に待ち、SIGKILLを送らない。停止が固まったらforce kill/reboot/restartで進めず報告する。親ユーザーマネージャーの5秒制限は承認済み方針どおり維持したため、突然のOS shutdown時に親からの強制終了を完全に避ける保証はない。Restart=noなので異常終了時は自動復旧せず、状況確認とユーザー判断を必要とする。今回、通常停止・計画再起動に関する未解決の阻害要因はない。
+
+将来のモデル切替・計画再起動は、**リクエストなし確認 → `systemctl --user stop halogen-active.service` → inactive/container消失/8731消失/GTTが基準付近へ戻ったことを確認 → 承認済みactive定義を選択・照合 → OS再起動**の順とする。Dense用定義や切替コマンドは今回作っていない。systemd管理中に手動run.shを実行しない。
+
+恒久変更は上記ユーザー設定2ファイルと当該ユーザーのlingerのみ。付随してQuadlet生成unit・default.targetリンク・rootlessコンテナ・journalが生じる。ソフトウェア追加、モデル/imageの取得、既存モデル/cache/graphrootの削除、run.sh変更、親user manager/PAM/limits/カーネル/GPU/BIOS/UEFI/ネットワーク設定変更はない。既存run.shのSHA-256 `5cb53066f338a15cb9c621d0b330998e1ed8da9dcd830d67e07971a9df15d0a9` も不変。
+
+**切戻し手順（未実施）:** idleから上記systemctl正常停止・GPU解放を確認し、今回作った `~/.config/containers/systemd/halogen-active.container` と `~/.config/systemd/user/halogen-active.service.d/90-safe-stop.conf` の2ファイルだけを除去し、`systemctl --user daemon-reload`。空になった今回専用ディレクトリだけ必要に応じて除去する。生成されたdefault.targetリンクが消えたことを確認し、他用途がない場合だけ対象ユーザーのlingerをdisableする。モデル・image・graphroot・run.sh・既存memlock規則・親managerは維持する。旧第5/7節の親drop-in追加/削除案は今回の構成には適用しない。
+
+今回のtracked変更は **Quadlet、停止drop-in、本追補レポートの3ファイルだけ**。対象差分・公開情報・`git diff --check`を確認し、指定pathだけをstageしてmainへcommit/pushする。自己commit SHAとpush・origin/main包含確認は最終チャットで報告する。指示書・AGENTS.md・run.shに変更はない。
+
+追加参照: [Podman 5.7の非強制rmとlabel/name filter](https://docs.podman.io/en/v5.7.0/markdown/podman-rm.1.html)。異なるfilter keyをAND条件で使い、サービス所有コンテナだけを後処理対象とした。公式仕様だけで済ませず、上記実機確認を行った。

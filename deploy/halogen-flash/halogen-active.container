@@ -1,0 +1,33 @@
+[Unit]
+Description=Halogen Flash-Next inference server
+ConditionPathIsMountPoint=/srv/llm
+
+[Container]
+Image=ghcr.io/peonist-ai/halogen-flash-server:0.18.4
+Pull=never
+ContainerName=halogen-flash
+Label=io.evox2.halogen.service=halogen-active
+Volume=/srv/llm/models/halogen-flash:/models:ro
+Environment=HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2.hgn
+PublishPort=127.0.0.1:8731:8731
+AddDevice=/dev/kfd
+AddDevice=/dev/dri
+GroupAdd=keep-groups
+Ulimit=memlock=-1:-1
+PodmanArgs=--ipc=host
+
+[Service]
+Restart=no
+LimitMEMLOCK=infinity
+ExecStartPre=/usr/bin/test -d /srv/llm/containers/podman
+ExecStartPre=/usr/bin/bash -ec 'for file in qwen38-flash-next-v2.hgn qwen38-flash-next-ngram.hgn tokenizer/tokenizer.json tokenizer/tokenizer_config.json tokenizer/chat_template.jinja; do test -r "/srv/llm/models/halogen-flash/$$file"; test -s "/srv/llm/models/halogen-flash/$$file"; done'
+ExecStartPre=/usr/bin/bash -ec 'for node in /dev/kfd /dev/dri/renderD*; do test -r "$$node"; test -w "$$node"; done'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(id -u)" -ne 0; test "$$(ulimit -S -l)" = unlimited; test "$$(ulimit -H -l)" = unlimited'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(/usr/bin/podman info --format "{{.Host.Security.Rootless}}")" = true'
+ExecStartPre=/usr/bin/podman image exists ghcr.io/peonist-ai/halogen-flash-server:0.18.4
+# Refuse both running and stopped containers before Quadlet's generated --replace.
+ExecStartPre=/usr/bin/bash -ec 'existing=$$(/usr/bin/podman ps -a --filter "name=^halogen-flash$$" --format "{{.Names}}"); test -z "$$existing"'
+ExecStartPre=/usr/bin/bash -ec 'listeners=$$(/usr/bin/ss -H -ltn "sport = :8731"); test -z "$$listeners"'
+
+[Install]
+WantedBy=default.target
