@@ -1,6 +1,6 @@
 # Halogen 対話式モデル選択・再起動切替 実施レポート
 
-> **最新状態（2026-10-15、承認後の再開）: `PASS`。Dense専用の143許容と停止結果の個別検査を反映し、残り1回の再起動でFlashのログイン前自動起動・LAN8731・Thinking ONを確認した。Flash active/running、Dense停止。再起動は初回分と合計2回。詳細は第11節。第1〜10節は17:58時点の中断履歴であり、現在状態ではない。**
+> **最新状態（2026-10-16）: `WAITING_FOR_USER_REBOOT`。ユーザーによる切替がFlash停止後に中断。停止後の観測遅延へ対処する修正版を配置し、Flashを通常起動してLAN8731のhealth/models応答まで復旧した。ただし今回の中断条件は未確定で、修正版による実際のモデル切替・再起動は未検証。前回までに試験上限2回を使用済みのため、追加の往復試験には承認が必要。詳細は第12節。第1〜11節は過去の実施履歴。**
 
 ## 1. 初回実施時の結論・中断状態
 
@@ -318,3 +318,90 @@ HTTP正常応答、finish_reason=stop、回答「一人3個、余り2個です�
 残る制約は、Denseの予期しない143終了も当該unitではsuccess分類になること、明示的なengine/API全cleanupログが得られないこと、idle検査と新規HTTP到着の競合、突発shutdown時の親managerの5秒期限。第5節の初回Flash複合gate不成立の内訳も未確定の履歴として残す。これらを解消したとは主張せず、今回の通常切替・資源返却の成功と区別する。
 
 対象3ファイルだけをstageし、差分・LF・hash・実行属性・秘密情報・`git diff --check`を確認してcommit/pushする。Flash正本、Dense Quadlet/run.sh、指示書・AGENTS.mdに変更はない。今回の自己commit SHA、push結果、origin/main包含・最終cleanは最終チャットで報告する。
+
+## 12. 2026-10-16: 切替中断の調査・停止観測の修正
+
+### 12.1 今回の目的と確認できた事実
+
+ユーザーから、切替後もモデルが変わらず、再度実行すると「前提/idle/boot先/実効unitが不一致」となる報告を受けた。解決対象は**最初のモデル切替が完了しなかったこと**であり、再実行のエラー説明やFlash復旧だけでは完了としない。
+
+`AGENTS.md`と同じ指示書commit `b1c3d7ec1fee2b252ded8b2ecfb9b5597e60fa2d`、既存レポート・selectorを再確認。Windows開始branchはmain、HEADは`ef709e7c7d8286ab17d4a6aaf9d0ebe795f958dc`、cleanで、fetch後のorigin/mainも同じ。WindowsからSSH alias `evox2`で同一Ubuntuホスト・非rootユーザーを確認した。既知のモデル・OS等の全面的な再調査は行っていない。
+
+10月16日06:25 JST以降の読み取り専用調査では以下を確認した。
+
+| 項目 | 証拠・結果 |
+|---|---|
+| 起動中OS | 最終bootは10月15日18:14:12 JST。今回の切替操作後のboot記録なし |
+| 選択対 | Flash正本のQuadlet/stop hashと一致。両ファイルmtimeも10月15日18:14:02 JSTのまま |
+| サービス | inactive/dead、Result=success、MainPID=0、ExecMainCode=1、ExecMainStatus=0 |
+| 実リソース | 全container不在、8731/8732閉鎖、GTT=18,661,376 bytes、GPU busy=0% |
+| selector | 配置hashは前回commitの`570823a8d141e2d7a261208d3c8185054354243c6b8d7961c08f80a118fb1f7f`と一致 |
+| 読み取り専用preflight | 環境・boot先・unit照合を通過し、running_idleのActiveState=active条件で拒否 |
+
+user journalの時刻をJSTへ換算した停止経過:
+
+- 06:13:44.480574: systemdがFlash停止を開始。
+- 06:13:44.618905: API application shutdown complete。
+- 06:13:44.633888: engine shutting down。
+- 06:13:45.508325: engine終了後のGTTを0.0 GiBとするHalogenログ。
+- 06:13:45.514821943: 対象containerのdiedイベント、終了コード0。
+- 06:13:45.588677334: 同containerのremoveイベント。
+- 06:13:45.631880: systemdがStoppedを記録。ExecStop/ExecStopPostともcode=exited、status=0。
+- 06:13:45.773以降: SSH session終了。OS再起動の証拠ではない。
+
+このため、**Flashの正常停止後、Denseへの切替・reboot完了へ進まなかった**ことは確認できる。一方、当時の端末出力は残っていないとユーザーから回答があり、旧selectorは判定結果をjournalへ保存していなかった。終了イベント未観測、GPU状態の一時的不一致、割込み等のどれで止まったかは確定できない。後から同じcontainer ID・停止時刻を指定した終了イベント照合と全停止条件はPASSしたが、当時の各読取値が同じだったとは推定しない。
+
+### 12.2 修正内容と適用範囲
+
+旧コードは、systemctl stopの直後に`podman events --stream=false`とGPU状態を一度だけ読み、全条件成立前に失敗すると設定変更も旧モデル起動も行わず終了する。この状態では次回のselectorも稼働前提で拒否される。
+
+Podman 5.7.0の[公式journal読取実装](https://github.com/containers/podman/blob/v5.7.0/libpod/events/journal_linux.go)でも、Stream=falseの読取りはjournalの末尾に達すると追加イベントを待たずに終了する。これは観測遅延を考慮すべき根拠であり、今回実際にイベントが遅れたという証明ではない。
+
+変更tracked fileは**selectorと本レポートの2件のみ**。Flash/DenseのQuadlet、停止drop-in、143の許容範囲、モデル・image・量子化・Thinking・context、親user managerは変更しない。
+
+1. 対象container IDと停止開始時刻に限定した終了イベント取得を、最大10秒の確認期限内で再読取りする。空の結果を終了コード0とみなさず、重複/非数値イベントや読取エラーも拒否する。再読取りでstopを再実行しない。
+2. GTTとGPU busyの既存条件が成立するまで最大10秒確認する。0.2秒間隔で条件そのものを読み直し、成立すれば即座に進む。固定時間待っただけで成功にはしない。
+3. Result=success、inactive、実行済みExecStop/ExecStopPostの終了0、containerとsystemdの終了コード一致、Flashは0/Denseは0または143、container/port不在、GTT基準＋16 MiB以下、busy=0を維持する。待機後に資源とsystemd結果を再確認する。未解放や終了失敗のまま設定更新・起動・rebootする経路は加えていない。
+4. **Yes後だけ**、既存journalへtag `llm-select`で処理段階と結果を記録する。停止結果、イベント取得、GPU解放、設定対設置、unit検証、rebootのどこで中断したかを残す。新しい選択state、ログ専用ファイル、常駐監視を作らない。No/Cancelではこのログも書かない。
+5. 停止済みサービスを前提検査で拒否した場合、その実状態を表示する。停止済み状態から無条件に別モデルへ進める仕様には変更しない。
+
+新selector SHA-256: `5e90a54121ac4c543a964948314a1dc2067281d07271e4c28fd1414cd4b8a0f3`。
+
+### 12.3 修正箇所の検証
+
+**Windows開発PC:** Git for Windows付属Bashによる`bash -n`はPASS。`.git`配下の一時fixtureに限定し、Podman/systemd/reboot/loggerを偽コマンドに置き換えた24ケースは全件PASS。実機への障害注入や再起動ではない。fixtureは試験後削除し、検証コードはtracked pathへ追加していない。
+
+| 試験群 | 判定 |
+|---|---|
+| 即時Flash0、Dense143、終了イベント遅延、GPU観測遅延 | 新版が停止条件成立後に成功 |
+| 同じイベント遅延・GPU遅延を旧版で再生 | 旧版は切替前に失敗。対象経路の再現に成功。実際の障害原因の確定とは区別 |
+| 終了イベント欠落、GPU未解放 | 確認期限後も失敗。安全条件を無視しない |
+| systemd失敗、ExecStop失敗、ExecStopPost失敗、Flash143、終了値不一致、重複イベント、想定外終了値 | すべて拒否 |
+| 想定外container・listener | すべて拒否 |
+| Yes前/Yes後の診断記録 | Yes前は記録なし、Yes後は段階を記録 |
+| 実際の停止後コードから設定対更新・reboot呼出までのfixture | イベント/GPU遅延とDense143では正しい対へ更新後に偽reboot。イベント欠落/GPU未解放では設定不変、daemon-reload・start・rebootなし |
+
+**Windows→Ubuntu:** 新版関数だけをメモリ上で読み込み、保存済みの実container終了イベント、現在のsystemd停止結果、container/port不在、GTTで照合した結果もPASS。この段階では配置済みscript・実サービスを変更していない。既存logger/timeoutも確認し、追加パッケージは導入しなかった。
+
+### 12.4 配置と実機の現在状態
+
+**Windows→Ubuntu、06:35 JST:** 候補をselector専用ディレクトリの一時ファイルへ転送。既存ディレクトリinodeのflock下で旧script hash、candidate hash、Bash構文、Flash設定対、環境・boot先・実効unitを検査した。停止済み状態は保存済み終了イベントと全停止条件で別途確認し、GTT基準復帰を確認してからscriptのみ0755でatomic renameした。旧scriptの一時退避・転送用ファイルは除去済み。
+
+その後、`systemctl --user start halogen-active.service`を1回実行。**06:35:55 JSTにactive/running、Result=success、NRestarts=0**を確認した。Quadlet/stopの差替え、daemon-reload、stop、OS rebootはこの追補作業では実行していない。
+
+- WindowsからLAN8731の`/health`と`/v1/models`に直接GETし、Flash応答を確認。
+- health: status=ok、model=halogen-qwen3.8-flash-next、api/engine=0.18.4、context=262144、slots=4、drafter=mtp、engine.responds=true、busy=false / in_flight=0 / queued=0。
+- 新版の**実機preflight全体もPASS**。GTT=29,054,521,344 bytes。Dense container不在・8732閉鎖。
+- 配置script hashは新版と一致。active Quadlet/stopのhashは従来Flash正本のまま。
+
+ここで確認したのは**Flashの復旧と切替前提の成立**である。新規Thinking生成、Denseへの実切替、切替後boot/API、往復成功は未実施であり、切替不具合を解決済みとは記載しない。
+
+### 12.5 残る検証・再起動承認・Git
+
+現在の状態は`WAITING_FOR_USER_REBOOT`。元指示書第5節Bの「合計最大2回」「3回目の再起動へ独断で進まない」に対し、前回までの実機試験で2回を使用済み。この追補では追加rebootを発行していない。
+
+必要な次の試験は、改修済みselectorの対話UIで**Flash→Dense→Flash（追加最大2回）**を通し、各回の正常停止・終了イベント・GTT解放・設定対照合、reboot後のログイン前自動起動、各LAN APIとThinking ON、他モデル停止を確認すること。今回加えたjournal記録も照合する。失敗時は記録された段階を原因特定に使用し、条件を無視したrebootは行わない。
+
+切戻しが必要なら、モデル切替が実行中でないことと現行hashを確認し、selectorだけを前回commitの内容へ戻せる。active Quadlet/stopやモデルに触れる必要はない。旧版へ戻すと今回の観測遅延対処・journal記録も失われる。いずれの版でも稼働中モデル・GPU異常を無視して切り替えない。
+
+selectorと本レポートのみを明示stageし、差分、LF、実行属性、秘密情報、`git diff --check`を確認してcommit/pushする。自己commit SHA・origin/main包含確認は最終チャットで報告する。今回の隔離試験PASSを、実機切替成功へ読み替えない。

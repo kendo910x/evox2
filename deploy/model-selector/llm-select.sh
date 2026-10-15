@@ -16,8 +16,17 @@ changed=0
 safe_stop=0
 reboot_accepted=0
 backup_q= backup_d= next_q= next_d=
+diagnostics=0
+phase=selection
+stop_observation_seconds=10
 
-say() { printf 'llm-select: %s\n' "$*"; }
+say() {
+    printf 'llm-select: %s\n' "$*"
+    # Only log after Yes. Use the existing journal, not a separate selection state.
+    if (( diagnostics )); then
+        logger -t llm-select -- "phase=$phase $*" || :
+    fi
+}
 fail() { say "$*" >&2; exit 1; }
 value() { systemctl --user show "$unit" --property="$1" --value; }
 hash() { sha256sum -- "$1" | cut -d ' ' -f 1; }
@@ -130,8 +139,41 @@ stop_commands_ok() {
     for property in ExecStop ExecStopPost; do
         record=$(value "$property") || return 1
         [[ "$record" == *' ; code=exited ; status=0 }' &&
-           "$record" != *'} {'* && "$record" != *'pid=0 ;'* ]] || return 1
+           "$record" != *'} {'* && "$record" != *'pid=0 ;'* ]] || {
+            say "$property の終了結果が不正: $record" >&2
+            return 1
+        }
     done
+}
+
+wait_container_exit() {
+    local deadline=$((SECONDS + stop_observation_seconds)) remaining event waiting=0
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        # A non-streaming journal read can finish before the event is observable.
+        # Re-read only this stopped container; never repeat stop or accept no event.
+        event=$(timeout --foreground "${remaining}s" podman events --stream=false \
+            --since "$stop_since" --filter "container=$container_id" \
+            --filter event=died --format '{{.ContainerExitCode}}') || {
+            say 'container終了イベントの読取り失敗。' >&2
+            return 1
+        }
+        if [[ -n "$event" ]]; then
+            [[ "$event" =~ ^[0-9]+$ ]] || {
+                say "container終了イベントが単一の終了コードではありません: $event" >&2
+                return 1
+            }
+            printf '%s\n' "$event"
+            return 0
+        fi
+        if (( ! waiting )); then
+            say "終了イベントがまだ見えません。最大${stop_observation_seconds}秒、同じcontainer IDを再照合します。" >&2
+            waiting=1
+        fi
+        sleep 0.2
+    done
+    say 'container終了イベントの確認期限を超過しました。終了成功とは扱いません。' >&2
+    return 1
 }
 
 gtt() { cat "$gtt_file"; }
@@ -151,6 +193,54 @@ empty_runtime() {
     [[ -z "$containers" ]] || { say '停止後もcontainerが存在します。' >&2; return 1; }
     [[ -z "$listeners" ]] || { say '停止後も8731/8732がlistenしています。' >&2; return 1; }
     gpu_released
+}
+wait_gpu_released() {
+    local deadline=$((SECONDS + stop_observation_seconds)) observation previous=
+    while :; do
+        if observation=$(diagnostics=0; gpu_released 2>&1); then
+            say "${observation#llm-select: }" >&2
+            return 0
+        fi
+        observation=${observation#llm-select: }
+        if [[ "$observation" != "$previous" ]]; then
+            say "$observation / GPU解放を最大${stop_observation_seconds}秒確認します。" >&2
+            previous=$observation
+        fi
+        (( SECONDS < deadline )) || break
+        sleep 0.2
+    done
+    say 'GPU解放の確認期限を超過しました。設定変更・再起動は行いません。' >&2
+    return 1
+}
+
+verify_stopped() {
+    local model=$1 container_exit state result code status
+    phase=stop-result
+    state=$(value ActiveState)
+    result=$(value Result)
+    code=$(value ExecMainCode)
+    status=$(value ExecMainStatus)
+    say "停止結果: ActiveState=$state Result=$result ExecMainCode=$code ExecMainStatus=$status"
+    [[ "$state" == inactive && "$result" == success ]] || return 1
+    stop_commands_ok || return 1
+    phase=stop-event
+    container_exit=$(wait_container_exit) || return 1
+    say "container exit=$container_exit"
+    [[ "$container_exit" == 0 || ( "$model" == dense && "$container_exit" == 143 ) ]] || {
+        say '想定外のcontainer終了コードです。' >&2
+        return 1
+    }
+    [[ "$code" == 1 && "$status" == "$container_exit" ]] || {
+        say 'systemdとcontainerの終了状態が一致しません。' >&2
+        return 1
+    }
+    phase=stop-gpu
+    wait_gpu_released || return 1
+    # Recheck every resource after waiting; a new container/listener is not ignored.
+    empty_runtime || return 1
+    [[ $(value ActiveState) == inactive && $(value Result) == success ]] || return 1
+    [[ $(value ExecMainCode) == "$code" && $(value ExecMainStatus) == "$status" ]] || return 1
+    stop_commands_ok || return 1
 }
 health_idle() {
     # Ubuntu's existing Python stdlib is used only to parse JSON strictly.
@@ -172,7 +262,10 @@ if m == "flash":
 }
 running_idle() {
     local model=$1 names used expected_gtt
-    [[ $(value ActiveState) == active && $(value SubState) == running && $(value Result) == success ]] || return 1
+    [[ $(value ActiveState) == active && $(value SubState) == running && $(value Result) == success ]] || {
+        say "稼働前提不成立: $model / ActiveState=$(value ActiveState) SubState=$(value SubState) Result=$(value Result)。停止済みの場合は旧モデルの安全な復旧確認が必要です。" >&2
+        return 1
+    }
     names=$(podman ps -a --format '{{.Names}}') || return 1
     [[ "$names" == "halogen-$model" ]] || return 1
     podman inspect "halogen-$model" | python3 -c '
@@ -239,6 +332,9 @@ cleanup() {
     local rc=$? restored=1 f
     trap - EXIT HUP INT TERM
     set +e
+    if (( diagnostics && rc != 0 )); then
+        say "切替未完了: phase=$phase exit=$rc changed=$changed safe_stop=$safe_stop。切替成功として扱いません。" >&2
+    fi
     if (( changed && ! reboot_accepted )); then
         if [[ $(value ActiveState) != inactive ]] || ! empty_runtime; then
             say "復元保留: runtime状態が変化しました。設定を重ねず退避を保持: $backup_q $backup_d" >&2
@@ -283,7 +379,7 @@ trap 'fail "端末切断または割込み。切替を中断します。"' HUP I
 [[ "$HOME" == "$(getent passwd "$(id -u)" | cut -d : -f 6)" ]] || fail 'HOMEが実ユーザーと不一致です。'
 [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]] || fail 'ユーザーruntimeがありません。'
 [[ ${XDG_CONFIG_HOME:-$HOME/.config} == "$HOME/.config" ]] || fail '標準外XDG_CONFIG_HOMEは未対応です。'
-for command in whiptail flock podman systemctl systemd-analyze curl python3 sha256sum ss sudo; do
+for command in whiptail flock podman systemctl systemd-analyze curl python3 sha256sum ss sudo logger timeout; do
     command -v "$command" >/dev/null || fail "Missing command: $command"
 done
 [[ -d "$base" && -O "$base" && ! -L "$base" ]] || fail 'selector配置先・所有者が不一致です。'
@@ -319,6 +415,9 @@ if ! whiptail --title 'Reboot?' --defaultno --yesno \
 fi
 
 # Every write and every service operation is below the explicit Yes gate.
+diagnostics=1
+phase=preflight
+say "切替開始: $original -> $selected"
 gtt_files=(/sys/class/drm/card*/device/mem_info_gtt_used)
 [[ ${#gtt_files[@]} == 1 && -r ${gtt_files[0]} ]] || fail 'GTT監視対象が一意でありません。'
 gtt_file=${gtt_files[0]}
@@ -333,20 +432,13 @@ fi
 container_id=$(podman inspect "halogen-$original" --format '{{.Id}}')
 stop_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 say "正常停止: $original / GTT before=$(gtt) bytes"
+phase=stop-command
 systemctl --user stop "$unit" || fail 'systemd停止失敗。設定変更・再起動を行いません。'
 # --rm removes inspect state. Read the persisted event for this exact ID;
 # do not leave a background waiter holding the selector lock after an error.
-container_exit=$(podman events --stream=false --since "$stop_since" \
-    --filter "container=$container_id" --filter event=died --format '{{.ContainerExitCode}}') || \
-    fail 'container終了イベントを取得できません。設定変更・再起動を行いません。'
-systemctl --user show "$unit" -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p ExecStop -p ExecStopPost
-say "container exit=$container_exit / GTT after=$(gtt) bytes"
-[[ $(value ActiveState) == inactive && $(value Result) == success ]] || fail 'systemdが正常停止を報告していません。終了コードだけで成功扱いせず保留します。'
-stop_commands_ok || fail 'ExecStop/ExecStopPostの正常終了を確認できません。設定変更・再起動を行いません。'
-[[ "$container_exit" == 0 || ( "$original" == dense && "$container_exit" == 143 ) ]] || fail '想定外のcontainer終了コードです。'
-[[ $(value ExecMainCode) == 1 && $(value ExecMainStatus) == "$container_exit" ]] || fail 'systemdとcontainerの終了状態が一致しません。'
-empty_runtime || fail 'container/port/GTTが解放されていません。設定変更・再起動を行いません。'
+verify_stopped "$original" || fail "正常停止の全条件を確認できません（$phase）。設定変更・再起動を行いません。"
 safe_stop=1
+phase=templates
 templates_ok && [[ $(identify) == "$original" ]] || fail '停止中に設定が変更されました。'
 
 # Backups and staged files are adjacent to each destination, then renamed.
@@ -361,10 +453,12 @@ install -m 0644 -- "$(dtemplate "$selected")" "$next_d"
 checked_file "$next_q" "$(qhash "$selected")" && checked_file "$next_d" "$(dhash "$selected")" || fail '設置前hash不一致です。'
 checked_file "$backup_q" "$(qhash "$original")" && checked_file "$backup_d" "$(dhash "$original")" || fail '退避hash不一致です。'
 changed=1
+phase=install-pair
 mv -fT -- "$next_q" "$quadlet"
 mv -fT -- "$next_d" "$dropin"
 [[ $(identify) == "$selected" ]] || fail '切替後の設定対が不一致です。'
 systemctl --user daemon-reload
+phase=verify-unit
 unit_ok "$selected" || fail '生成unit/停止設定/default.targetの整合性検査に失敗しました。'
 [[ $(value ActiveState) == inactive ]] && empty_runtime || fail '再起動直前にruntime状態が変化しました。'
 systemctl --user show "$unit" -p ExecStart -p ExecStop -p ExecStopPost -p Restart
@@ -373,6 +467,7 @@ sync -f "$quadlet"
 sync -f "$dropin"
 # A successful reboot disconnects SSH. Do not roll back in response to that HUP.
 trap '' HUP INT TERM
+phase=reboot
 if sudo -n reboot; then
     reboot_accepted=1
     exit 0
