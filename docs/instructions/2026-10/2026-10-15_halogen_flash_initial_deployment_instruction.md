@@ -34,6 +34,8 @@
 
 BIOS変更がまだの場合、Codexは**許可された準備作業だけ進めた後、`WAITING_FOR_USER_UMA`として実施レポートをcommit/pushして終了**してよい。ユーザーがBIOSを変更した後、**同じ指示書から再開**する（新しい指示書は不要）。未起動なのに完了と報告しない。
 
+**2026-10-15 再開追補（ユーザー実測）:** BIOSのUMA固定割当を96GiBから最小の明示値2GiBに変更し、Ubuntu再起動後に`free -h`の`Mem total=121Gi`、`available=119Gi`、`mem_info_vram_total=2147483648` bytes（2GiB）を確認済み。これらはユーザー提供の実測であり、Codexは新たなSSHセッションから必要最小限のread-only再確認を行う。確認できた場合、過去の`WAITING_FOR_USER_UMA`は解消とし、**Phase Aの完了済み手順を再実行せず、A4のmemlock設定とPhase Bへ進む**。値が戻っていたら停止・報告する。
+
 ## 3. 必須読込・開始時確認
 
 最初に本リポジトリの `AGENTS.md`、次に本指示書、初回調査レポートを読む。現行Git状態を確認する。
@@ -110,9 +112,31 @@ grep '^CONFIG_HSA_AMD_SVM=' "/boot/config-$(uname -r)"
 
 このPhase Aで得るべき結果: 独立したモデル保存先、Podman動作、KFD/render使用可能、SSH継続、リスクのないGit管理ができること。BIOSが未変更ならここで`WAITING_FOR_USER_UMA`を報告して終了する。
 
+### A4. 再開追補：rootless Podman用memlockの上限修正
+
+前回の中間レポートでは対象ログインユーザーの`RLIMIT_MEMLOCK`のsoft/hardがともに8MiBで、rootless Podman内ではhard limitを超えて引き上げられなかった。Halogen公式`docs/host-setup.md`によれば、`--ulimit memlock=-1:-1`を指定してもSSHログイン側のhard limitを超えられないため、**大きなモデルのロックにはログインユーザーのmemlock設定が必要**。
+
+**この指示書で許可する追加変更は、EVO-X2の対象SSHログインユーザー1名のmemlock上限だけ**とする。全ユーザーへの無制限付与、rootlessからrootfulへの切替、SSH/sudoers/PAMの既存設定変更、他のrlimit変更、サービス再起動は禁止する。
+
+1. `[Windows開発PC]` から新しい`ssh evox2`セッションを開く。対象ホスト・ユーザー・`sudo -n true`、`ulimit -S -l`、`ulimit -H -l`、既存`/etc/security/limits.d/`の対象設定を確認する。既にsoft/hardとも`unlimited`ならファイルを追加せず次へ進む。
+2. soft/hardのいずれかが不足する場合、**他者の既存設定を上書きしない**ことを確認し、`/etc/security/limits.d/90-evox2-halogen-memlock.conf`を新規作成して当該ログインユーザー1名にのみ以下を指定する。ここで`<login-user>`は実機の`id -un`で取得し、リポジトリや公開レポートには書かない。
+
+   ```text
+   <login-user> soft memlock unlimited
+   <login-user> hard memlock unlimited
+   ```
+
+3. `0644`など通常のlimits.dファイル権限にし、作成内容・重複設定の有無を確認する。**現在のSSHセッションのlimitが変わらないのは正常**。新しいSSH接続を作成し、`ulimit -S -l`と`ulimit -H -l`が両方`unlimited`になったことを確認する。必要に応じてread-onlyでPAM適用状態を調査してよいが、PAM設定を変更する必要が出たら停止・報告する。`systemctl restart ssh`やホスト再起動はしない。
+4. 新セッションから`podman unshare`等でrootlessプロセスの上限継承を確認する。Podmanの通常起動時には公式どおり`--ulimit memlock=-1:-1`を使い、実際のコンテナ起動ログでモデルのpin/lock成否を確認する。上限設定だけをHalogen起動成功と扱わない。
+5. この変更により大容量のメモリがロック可能となり、ホストメモリ圧迫時のOOMリスクがある。Halogen以外の大きな常駐GPU負荷は勝手に起動しない。問題が生じた場合の切戻しは**今回作った専用limits.dファイルだけの削除と新たなSSHログイン**であり、既存の他の設定には触れない。実施内容と副作用はレポートへ追記する。
+
+**Phase Bへ進む前の確認:** ユーザー実測のUMA変更が実機でも確認され、rootless Podmanが想定どおりmemlock上限を継承したこと。どちらかが不明ならモデルのダウンロード・ロードへ進まず、事実と対策案を報告する。
+
+公式資料: https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/host-setup.md
+
 ## 5. Phase B: BIOS変更確認後の初回Halogen Flash起動
 
-**開始gate:** UbuntuでUMA最小化が観測上確認でき、KFD/render利用可能、`/srv/llm`が想定Linux SSD上のマウントで、モデル領域に**160GiB以上の空き**、かつPodmanの実際の保存先（`/srv/llm` 配下を優先）にimage展開用の十分な空きがあること。root側に保存が発生するならrootの空きも確認する。満たさなければモデルダウンロードはしない。
+**開始gate:** UbuntuでUMA最小化が観測上確認でき（ユーザー実測:固定2GiB、Linux RAM 121GiB）、KFD/render利用可能、**A4でmemlock上限の新SSHログインへの適用とrootless Podmanへの継承を確認済み**、`/srv/llm`が想定Linux SSD上のマウントで、モデル領域に**160GiB以上の空き**、かつPodmanの実際の保存先（`/srv/llm` 配下を優先）にimage展開用の十分な空きがあること。root側に保存が発生するならrootの空きも確認する。満たさなければモデルダウンロードはしない。
 
 BIOS設定変更の操作はユーザー側のみ。設定済みでもCodexは勝手に再起動しない。設定を変えて再起動後のホストと確認できたときのみこのPhaseへ進む。
 
@@ -171,9 +195,9 @@ EVO-X2から `http://127.0.0.1:8731` を確認し、必要ならWindowsからSSH
 
 ## 6. 明示的な許可範囲・禁止事項
 
-**今回許可:** Ubuntu側でのPodmanと必要最小限のapt導入、対象SSHユーザーのrender group追加、**対象Linux SSD上のVG空きextents全量を使う新規LV**の作成・新規LVのみのext4初期化・`/srv/llm`へのfstab登録、初期rootless Podmanのユーザー専用ストレージ配置設定、指定モデルの130GiB以内の一度限りのダウンロード、指定コンテナの起動/正常停止、必要な一時ログ閲覧、run.sh転送と限定的なAPIテスト。
+**今回許可:** Ubuntu側でのPodmanと必要最小限のapt導入、対象SSHユーザーのrender group追加、**対象Linux SSD上のVG空きextents全量を使う新規LV**の作成・新規LVのみのext4初期化・`/srv/llm`へのfstab登録、初期rootless Podmanのユーザー専用ストレージ配置設定、**A4記載の対象ログインユーザー1名だけのmemlock limits.d新規設定**、指定モデルの130GiB以内の一度限りのダウンロード、指定コンテナの起動/正常停止、必要な一時ログ閲覧、run.sh転送と限定的なAPIテスト。
 
-**今回禁止:** Windows SSDやそのEFI/NTFSへの書込、既存partition/LVのformat/縮小/移動、BIOS/UMA/UEFI変更、カーネル/ファームウェア更新、全面OS更新、SSH/sudoers/firewallの変更、電力設定変更、rootful/privilegedへの無断fallback、GUI追加、NPU/27B Denseの導入、リモートAPI公開、systemd永続service登録、モデルの未承認変更、長時間高負荷試験、他repoやv3への操作。既存SSHアクセスを失う操作はしない。
+**今回禁止:** Windows SSDやそのEFI/NTFSへの書込、既存partition/LVのformat/縮小/移動、BIOS/UMA/UEFI変更、カーネル/ファームウェア更新、全面OS更新、SSH/sudoers/firewall/PAM既存設定の変更、**A4の対象限定memlock以外のlimit設定変更**、電力設定変更、rootful/privilegedへの無断fallback、GUI追加、NPU/27B Denseの導入、リモートAPI公開、systemd永続service登録、モデルの未承認変更、長時間高負荷試験、他repoやv3への操作。既存SSHアクセスを失う操作はしない。
 
 ダウンロード先は `/srv/llm` に限定し、rootやHOMEのHugging Face cacheへ巨大なモデルを二重に落とさない。PodmanイメージはPodmanの管理領域に保存されるが、今回の新規導入では原則 `/srv/llm/containers/podman` を使う構成を優先し、実際の保存先と残容量を記録する。必要な処理がこの範囲を超えたら停止・報告する。
 
@@ -187,7 +211,7 @@ EVO-X2から `http://127.0.0.1:8731` を確認し、必要ならWindowsからSSH
 - `Phase A` のpreflight結果、LVM VG/PV/LV確認と実施した変更、GPU権限、Podman状態、SSH保持。
 - BIOSが必要なら **`WAITING_FOR_USER_UMA`** として、ユーザーがすべき操作、観測値、Windowsへも影響し得ることを簡潔に報告。実機作業の未完了をPASSにしない。
 - `Phase B`に進めたら実際のモデルファイルのサイズと版、イメージdigest、container名、bind範囲、API URL（loopbackのみ）、Thinking設定、検証結果、推論timings、ログ要約。
-- `/srv/llm`、Podman image、ローカルscript、`/etc/fstab`、group変更など**残った永続状態とアンインストール/切戻し手順**。削除コマンドを実行したのではなく手順として記録する。
+- `/srv/llm`、Podman image、ローカルscript、`/etc/fstab`、group変更、**対象ログインユーザーのmemlock設定と再ログイン後の確認結果**など**残った永続状態とアンインストール/切戻し手順**。削除コマンドを実行したのではなく手順として記録する。
 - 実施しなかったこと、失敗・保留、想定との差、追加の承認が必要な作業。
 - tracked変更file一覧、commit SHA、push結果、`origin/main`包含確認（自己commit SHAのレポート内自己参照は不要。最終チャットで報告可）。
 
