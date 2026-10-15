@@ -9,7 +9,7 @@ ContainerName=halogen-flash
 Label=io.evox2.halogen.service=halogen-active
 Volume=/srv/llm/models/halogen-flash:/models:ro
 Environment=HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2.hgn
-PublishPort=127.0.0.1:8731:8731
+PublishPort=0.0.0.0:8731:8731
 AddDevice=/dev/kfd
 AddDevice=/dev/dri
 GroupAdd=keep-groups

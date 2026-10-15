@@ -1,5 +1,7 @@
 # Halogen Flash-Next 常駐化・OS起動時自動起動 実施レポート
 
+> **ネットワーク設定の最新追補:** 同日13:56 JST、ユーザーの追加明示指示に従い `PublishPort=0.0.0.0:8731:8731` へ変更・実機反映した。正常停止・GPU解放後にサービスを起動し、WindowsからSSH転送なしのLAN直接接続を確認済み。詳細は **第12節**。それ以前のloopback限定・設定hashは当時の履歴である。
+
 > **最新状態: `PASS / RUNNING`（2026-10-15 再開追補）。** 更新指示書commit `88dfed241f2042c975f9c3b208536246c8409eb5` に従い、QuadletとHalogen専用停止drop-inを配置した。正常停止・GTT解放、SSH切断耐性、OS再起動1回後のログイン前自動起動、Thinking ON APIを実証した。最終状態は `active/running`、Linger=yes、Restart=no。詳細は **第9節以降**。第1～8節は前回の停止調査の履歴であり、当時の未実施・要承認の記載を保持している。親ユーザーマネージャーを変更する旧提案は採用していない。
 
 ## 1. 結果
@@ -306,3 +308,42 @@ reasoning_contentは274/180文字。MTP draft/acceptedは125/96と55/43、cache_
 今回のtracked変更は **Quadlet、停止drop-in、本追補レポートの3ファイルだけ**。対象差分・公開情報・`git diff --check`を確認し、指定pathだけをstageしてmainへcommit/pushする。自己commit SHAとpush・origin/main包含確認は最終チャットで報告する。指示書・AGENTS.md・run.shに変更はない。
 
 追加参照: [Podman 5.7の非強制rmとlabel/name filter](https://docs.podman.io/en/v5.7.0/markdown/podman-rm.1.html)。異なるfilter keyをAND条件で使い、サービス所有コンテナだけを後処理対象とした。公式仕様だけで済ませず、上記実機確認を行った。
+
+## 12. LAN待受への変更・実機反映（追加明示指示）
+
+### 12.1 指示・変更範囲
+
+- 実施日時: 2026-10-15、13:55～13:57 JSTに実機検証、その後Git反映。Windows開発PC上のCodexから `ssh evox2` で同じUbuntuホスト・rootlessユーザーを操作した。
+- 今回の実行指示は、このチャットのユーザーによる `PublishPort=127.0.0.1:8731:8731` → `PublishPort=0.0.0.0:8731:8731` の追加明示依頼。アイドル確認、systemd正常停止、GPU解放確認、設定反映、サービス起動を承認し、OS再起動は不要、ルーターのポート転送・外部公開は行わないという範囲だった。既存指示書commit `88dfed241f2042c975f9c3b208536246c8409eb5` のloopback制限はこの追加指示で変更された。新しい指示書commitはない。
+- `AGENTS.md` を先に読んだ。Windows側branch=`main`、開始HEAD=`75118e558ec3b91cb88669440642b89cd50028e0`、clean、fetch後もorigin/mainと一致。他タスク変更なし。実機の既存Quadlet/drop-in hashは第9.2節と一致し、同じサービスがactive/running、NRestarts=0であることを確認した。
+- tracked変更は `deploy/halogen-flash/halogen-active.container` の **PublishPort 1行** と、本レポートの追補のみ。実機では既存 `~/.config/containers/systemd/halogen-active.container` だけを更新した。停止drop-in、親manager、run.sh、モデル/image、認証、Firewall、SSH、ルーター設定は変更していない。
+
+### 12.2 正常停止と設定反映
+
+**[EVO-X2 Ubuntu/SSH]** `/health` がstatus=ok、engine.responds=true、busy=false / in_flight=0 / queued=0であることを停止直前に確認した。13:55:52～53 JSTに `systemctl --user stop halogen-active.service` が1.193秒で正常完了した。
+
+- GTT: **29,085,544,448 → 18,661,376 bytes**。前回の停止時基準と一致。
+- systemd: inactive/dead、Result=success、ExecMainStatus=0、ExecStop/ExecStopPostともstatus=0、NRestarts=0。
+- container消失・8731 listen消失、journalのstop requested / engine・API shutdown complete / GTT 0.0 GiB / Stoppedを確認。force killやforce rmは実行していない。
+
+**[Windows開発PC→EVO-X2 Ubuntu]** 変更後のQuadletを既存配置先へコピーし、SHA-256一致を確認した。新hashは **`cb6c6357066d68a0a7a8a035c8b61de8950ffa8847665b4bae23689c8ec03446`**。停止drop-inのhashは第9.2節から不変。`systemctl --user daemon-reload`、`systemd-analyze --user --generators=true verify halogen-active.service` が成功し、実効ExecStartに `--publish 0.0.0.0:8731:8731` が入ったことを確認した。
+
+13:56:11 JSTに `systemctl --user start halogen-active.service` を実行し、active/runningへ復帰。warmロードはmodel ready 2.5秒、engine listening after 4秒。停止経路は従来の非強制stop/rmのまま、TimeoutStopSec=infinity、SendSIGKILL=no、Restart=no。コンテナ内soft/hard memlockはunlimited、Linger=yes、既存image IDも不変。**OS再起動は0回**で、boot時刻が前回検証後のままであることも確認した。
+
+### 12.3 LAN直接接続の検証・最終状態
+
+**[Windows開発PC]** SSH設定の接続先をローカルで参照し、実IPをレポートへ保存せず `http://<EVO-X2のLANアドレス>:8731` へ直接HTTP接続した。SSHトンネルなし、HTTP proxyなし、Authorizationヘッダーなしで確認した。
+
+| 検証 | 結果 |
+|---|---|
+| `/health`・`/v1/models` | PASS。正常HTTP応答、status=ok、engine.responds=true、model=`halogen-qwen3.8-flash-next`、thinking_control=true |
+| Thinking ONの日本語短問 | PASS。「りんご17個を5人に配る」への回答は「一人3個、余り2個」、finish_reason=stop、非空reasoning_content（180文字） |
+| 設定・実待受 | PASS。Podman PortBindingsはHostIp=0.0.0.0 / HostPort=8731。実際のssはIPv6側のwildcard socket `*:8731` として表示され、IPv4 LANからのHTTPも成功した |
+| 最終状態 | PASS。13:57:13 JST、active/running、NRestarts=0、health ok、busy=false / in_flight=0 / queued=0。操作SSHを終了し稼働を維持 |
+| OS再起動・ルーター変更・Firewall変更 | 未実施。今回必要なし |
+
+推論1件の条件はenable_thinking=true、reasoning_effort=low、temperature=0、max_completion_tokens=4096、stream=false、seed/top_p/top_k未指定。既存context=262144、MTP、checkpointは変更なし。input=74、completion=68（reasoning=56）tokens、pp=173.140 tok/s、tg=66.471 tok/s、prompt=427.4 ms、generation=1023.0 ms、Windows client wall=1.489秒。tgはThinkingを含む生成全体、TTFTは未測定。疎通確認1問であり性能比較・品質評価ではない。
+
+公開範囲は全インターフェースの8731待受へ拡大し、認証は従来どおり追加していない。自宅LAN利用というユーザー指定に基づく変更であり、アプリ側に接続元LANの制限を追加したものではない。観測時のglobal-scope addressはprivate IPv4が1件、IPv6は0件、公的アドレスは0件だった。`ufw status` はufw未導入のため確認できず、導入・設定変更はしていない。ルーターの既存設定やWANからの到達性は未検証で、外部公開・ポート転送の操作は行っていない。
+
+切戻し（未実施）は、同じidle確認→systemd正常停止→GPU解放確認の後、PublishPortを127.0.0.1へ戻してコピー・daemon-reload・startし、loopback待受を確認する。モデルやコンテナ保存先を削除する必要はない。今回の2ファイルだけの差分・`git diff --check`を確認してcommit/pushする。自己commit SHAとorigin/main包含確認は最終チャットで報告する。
