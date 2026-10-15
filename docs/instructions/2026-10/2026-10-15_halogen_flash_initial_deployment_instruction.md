@@ -89,10 +89,12 @@ grep '^CONFIG_HSA_AMD_SVM=' "/boot/config-$(uname -r)"
 
 1. `ubuntu-vg` 等の実在VGのPVが**対象Linux用KIOXIA SSDのLinux LVMパーティションだけ**であると確認できる。
 2. 既存`/srv/llm`が未使用・未マウントで、モデルなどの既存データがない。
-3. VGに**400GiB以上の未割当free extents**があり、新規LV作成後も他LVに影響しない。
+3. VGに**400GiB以上の未割当free extents**があり、利用可能な空きextents全量が対象Linux SSDに由来し、新規LV作成後も他LVに影響しない。
 4. 対象デバイス・VG・空き容量・コマンドの影響を確認できる。
 
-この場合、**新規LV `llm_data` を400GiBだけ作成し、当該新規LVだけをext4で初期化**、`/srv/llm`へマウントして`/etc/fstab`へUUID参照の1行を追加することを、この指示書で許可する。マウント後に`findmnt /srv/llm`、`df -h /srv/llm`、`lsblk`で確認。OSのroot、boot、既存LV、VGの既存データやWindows SSDには手を加えない。既存LVのフォーマット・削除・縮小・移動・パーティション変更は禁止する。
+この場合、**新規LV `llm_data` に検証済みのVG未割当free extentsを全量割り当てる（`lvcreate -l 100%FREE` 相当）**。**新規LVだけをext4で初期化**し、`/srv/llm`へマウント、`/etc/fstab`へUUID参照の1行を追加することを許可する。実際のVG名・新規LVのデバイスパスを表示・再確認してから実行し、マウント後に`findmnt /srv/llm`、`df -h /srv/llm`、`lsblk`、`vgs`で割当結果を確認。OSのroot、boot、既存LV、VGの既存データやWindows SSDには手を加えない。既存LVのフォーマット・削除・縮小・移動・パーティション変更は禁止する。
+
+この構成ではroot LVは**現状の100GiBのまま**、VGの未割当領域は基本的にゼロになる。将来rootを拡張したりLVM snapshotを作ったりする際の自由度は減るが、本タスクでは「空きVGを遊ばせずモデル用に全量使う」方針を採用する。root使用量が不足する懸念があるときは、既存LVの拡張・縮小に自動で進まず報告する。
 
 上記の一つでも満たさなければ**LVMを変更せず停止して設計案を報告**する。独断でroot拡張、別SSD利用、既存データ消去、ディスク全体の再初期化へ変更しない。
 
@@ -103,13 +105,14 @@ grep '^CONFIG_HSA_AMD_SVM=' "/boot/config-$(uname -r)"
 - `/dev/kfd`、render nodeが`root:render 0660`であり、ログインユーザーが`render`に属さない場合に限り、**当該ユーザーをrender groupへ追加する操作を許可**。追加後、再ログインした別SSHセッションで`id`・デバイスアクセスを検証する。既存SSH/sudo設定は変更しない。
 - 公式コンテナの使用に必要な**Ubuntu公式apt repositoryからのPodmanと通常依存パッケージのみ**導入を許可する。`sudo -n apt update`および`sudo -n apt install -y podman`は可。`apt upgrade`、OSリリース更新、追加ROCmホスト一式、Docker併設、GUI、Pythonのグローバルpip導入はしない。
 - rootless Podmanを第一選択にする。HALOGEN公式の `--device /dev/kfd --device /dev/dri --group-add keep-groups --ipc=host --ulimit memlock=-1:-1` を参考にする。**`--privileged`やrootful Docker/Podmanへ黙って切り替えない**。必要な権限が足りなければ症状と最小限の対策案を報告する。
+- root LVは100GiBなので、rootless Podmanのイメージ・コンテナストレージが既定のHOME配下を圧迫しないようにする。**新規導入で既存のPodmanストレージが存在しない場合**、`/srv/llm/containers/podman` を候補に、そのユーザー専用のPodman `storage.conf` の `graphroot` 等を必要最小限設定することを許可する。既存設定を上書きせず、Podman公式手順と実機状態を照合し、`podman info` で保存先を確認してから巨大なimageをpullする。複雑な移設やグローバルストレージ変更が必要なら停止・報告する。作成した設定ファイルの場所と削除方法をレポートへ記録する。
 - 既存GPUサービスが動作している場合は勝手に止めない。ポート8731、GPU使用中状態、空きディスク容量を調べる。
 
 このPhase Aで得るべき結果: 独立したモデル保存先、Podman動作、KFD/render使用可能、SSH継続、リスクのないGit管理ができること。BIOSが未変更ならここで`WAITING_FOR_USER_UMA`を報告して終了する。
 
 ## 5. Phase B: BIOS変更確認後の初回Halogen Flash起動
 
-**開始gate:** UbuntuでUMA最小化が観測上確認でき、KFD/render利用可能、`/srv/llm`が想定Linux SSD上のマウントで、モデル領域に**160GiB以上の空き**、root側にコンテナ用の十分な空きがあること。満たさなければモデルダウンロードはしない。
+**開始gate:** UbuntuでUMA最小化が観測上確認でき、KFD/render利用可能、`/srv/llm`が想定Linux SSD上のマウントで、モデル領域に**160GiB以上の空き**、かつPodmanの実際の保存先（`/srv/llm` 配下を優先）にimage展開用の十分な空きがあること。root側に保存が発生するならrootの空きも確認する。満たさなければモデルダウンロードはしない。
 
 BIOS設定変更の操作はユーザー側のみ。設定済みでもCodexは勝手に再起動しない。設定を変えて再起動後のホストと確認できたときのみこのPhaseへ進む。
 
@@ -168,11 +171,11 @@ EVO-X2から `http://127.0.0.1:8731` を確認し、必要ならWindowsからSSH
 
 ## 6. 明示的な許可範囲・禁止事項
 
-**今回許可:** Ubuntu側でのPodmanと必要最小限のapt導入、対象SSHユーザーのrender group追加、新規400GiB Linux用LVの作成・新規LVのみのext4初期化・`/srv/llm`へのfstab登録、指定モデルの130GiB以内の一度限りのダウンロード、指定コンテナの起動/正常停止、必要な一時ログ閲覧、run.sh転送と限定的なAPIテスト。
+**今回許可:** Ubuntu側でのPodmanと必要最小限のapt導入、対象SSHユーザーのrender group追加、**対象Linux SSD上のVG空きextents全量を使う新規LV**の作成・新規LVのみのext4初期化・`/srv/llm`へのfstab登録、初期rootless Podmanのユーザー専用ストレージ配置設定、指定モデルの130GiB以内の一度限りのダウンロード、指定コンテナの起動/正常停止、必要な一時ログ閲覧、run.sh転送と限定的なAPIテスト。
 
 **今回禁止:** Windows SSDやそのEFI/NTFSへの書込、既存partition/LVのformat/縮小/移動、BIOS/UMA/UEFI変更、カーネル/ファームウェア更新、全面OS更新、SSH/sudoers/firewallの変更、電力設定変更、rootful/privilegedへの無断fallback、GUI追加、NPU/27B Denseの導入、リモートAPI公開、systemd永続service登録、モデルの未承認変更、長時間高負荷試験、他repoやv3への操作。既存SSHアクセスを失う操作はしない。
 
-ダウンロード先は `/srv/llm` に限定し、rootやHOMEのHugging Face cacheへ巨大なモデルを二重に落とさない。PodmanイメージはPodman管理領域に作られることを許容する。必要な処理がこの範囲を超えたら停止・報告する。
+ダウンロード先は `/srv/llm` に限定し、rootやHOMEのHugging Face cacheへ巨大なモデルを二重に落とさない。PodmanイメージはPodmanの管理領域に保存されるが、今回の新規導入では原則 `/srv/llm/containers/podman` を使う構成を優先し、実際の保存先と残容量を記録する。必要な処理がこの範囲を超えたら停止・報告する。
 
 ## 7. 実施レポート・Git反映
 
