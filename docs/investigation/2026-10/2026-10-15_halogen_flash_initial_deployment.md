@@ -1,5 +1,7 @@
 # Halogen Flash-Next 初回導入 実施レポート
 
+> **最新状態（2026-10-15 12:33 JST）: 初回導入・Thinking ONの日本語API疎通は成功。検証後に正常停止済み。** モデル・image・通常起動スクリプトは配置済み。自動起動・常時稼働は設定していない。第1〜7節は11:27 JSTまでのPhase A中間報告であり、その時点の未実施・待機状態を記録している。UMA変更後の結果は第8節以降。
+
 ## 1. 状態・実施条件
 
 **状態: `WAITING_FOR_USER_UMA`。Phase Aのストレージ・GPU権限・rootless Podmanの準備を実施した。Phase Bのイメージ/モデル取得、Halogen起動、API疎通は未実施であり、初回導入全体は未完了。**
@@ -177,3 +179,182 @@ Phase Bでは指定の `ghcr.io/peonist-ai/halogen-flash-server:0.18.4` と公�
 - commit前に本文、機密情報、`git diff --check`、対象差分とstage範囲を確認する。
 - 実際のcommit SHA、push結果、push後の `origin/main` 包含確認は**最終チャットで報告**する。
 - 次工程: ユーザーによるUMA変更後、同じ指示書からPhase Bを再開し、本レポートに追補する。初回導入成功、性能達成、恒久稼働への移行はいずれもまだ宣言しない。
+
+## 8. UMA変更後の再開・A4
+
+- 再開日: 2026-10-15。実行主体は引き続きWindows開発PC上のCodex、実機操作は `ssh evox2` 経由。
+- 更新指示書: `docs/instructions/2026-10/2026-10-15_halogen_flash_initial_deployment_instruction.md`、commit `38d2612c6518d89c2f241a535852ba816a6fefda`。
+- 再開時のbranchは `main`、HEADは前回報告commit `10ebac6ce3a2d19279710410768305d726c005a2`、作業ツリーclean。`AGENTS.md` を先に読み、fetch・指示書commitの包含確認後にfast-forwardした。対象ファイルに他タスクの変更はなかった。
+- 前回完了したLV作成、format、fstab追記、apt導入、render group追加、storage.conf作成は再実行していない。
+
+### 8.1 Phase B開始条件の再確認
+
+| 確認項目 | 結果 |
+|---|---|
+| 対象・権限 | 同じUbuntu 26.04.1 LTS、kernel `7.0.0-38-generic`、対象一般ユーザーを確認。新規SSHと `sudo -n true` が成功 |
+| UMA/RAM | `MemTotal=127098452 kB`（約121.21 GiB）、採取時 `MemAvailable=125382784 kB`。GPU固定VRAMは2147483648 bytes（2 GiB）。ユーザーのUMA変更を観測値で再確認し、`WAITING_FOR_USER_UMA` は解消 |
+| GPU/GTT | gfx1151、SVM/CWSR前提は前回同様。GTT total=65074405376 bytes、開始時used=18661376 bytes、GPU busy=0%。再起動後のGPU sysfsはcard1であり、card0固定参照を訂正して実デバイスを確認 |
+| GPU権限 | `/dev/kfd` と `/dev/dri/renderD128` のread/write可。render資格を維持 |
+| データ領域 | Linux側KIOXIA SSDの同じPV/VG/LV、`/srv/llm` mountを確認。開始時空き773 GiB、root空き82 GiB。Windows側SSDは操作していない |
+| Podman | rootless、crun、graphroot `/srv/llm/containers/podman` を確認。開始時image/containerなし、8731のlistenなし |
+| memlock | 以下のA4適用後、新SSH・rootless namespaceとも無制限を確認してからPhase Bへ進んだ |
+
+### 8.2 memlockの変更と検証
+
+既存の競合するmemlock規則がなく、専用ファイルが未存在であることを確認した。`/etc/pam.d/sshd` に既存の `session required pam_limits.so` があったため、PAM設定変更は不要だった。
+
+**[EVO-X2 Ubuntu/SSH]** `/etc/security/limits.d/90-evox2-halogen-memlock.conf` を排他的な新規作成で追加し、mode 0644とした。実機の `id -un` で得た1名だけに次の2行を設定した。公開用の表記はプレースホルダーとする。
+
+```text
+<login-user> soft memlock unlimited
+<login-user> hard memlock unlimited
+```
+
+既存セッションは8192 KiBのまま、新しいSSH接続ではsoft/hardとも `unlimited`。`podman unshare` 内の `resource.getrlimit(resource.RLIMIT_MEMLOCK)` は `(-1, -1)`、対象規則は重複なく2行だった。コンテナinspectでもmemlockのSoft/Hard=-1を確認した。全ユーザー・他のlimit・既存PAM/SSH/sudoersは変更せず、サービス再起動もしていない。無制限という上限設定と、モデルの実際のpin/lock成功は別に評価する。
+
+## 9. Phase B取得・起動の記録
+
+### 9.1 配布物
+
+**[EVO-X2 Ubuntu/SSH]** `TMPDIR=/srv/llm/containers/tmp podman pull --quiet ghcr.io/peonist-ai/halogen-flash-server:0.18.4` が終了コード0。pull所要約61秒。
+
+| 項目 | 確認値 |
+|---|---|
+| image tag | `ghcr.io/peonist-ai/halogen-flash-server:0.18.4` |
+| image digest | `sha256:1a458cd6decdd3a2c27f96196cc3a0bc853cbb3905320c3461d29137072faa78` |
+| image ID | `556c3c8179d8a566cc0ec0a7f7f54f9f3cb8b77e7bc4a4175e7c23ae359ad80a` |
+| image metadata | version 0.18.4、revision `968a683de2ad`、size 3598114683 bytes、entrypoint `/usr/local/bin/entrypoint.sh` |
+| model repository | `peonist-ai/halogen-qwen3.8-flash-next`、確認時revision `cf41ff9fc97b6dd9887d82e21269522de6208055` |
+| model選択 | 標準v2。旧w4b/GGUF/別量子化への変更なし |
+| 取得予定量 | 公式entrypoint表示110.6 GiB。v2・ngram・visionとtokenizer。130 GiB上限内 |
+| ライセンス表記 | imageは `LicenseRef-Peonist-EULA`、モデルカードはApache-2.0。エンジンEULAとモデルの条件は別。配布・改変時は各原文を再確認する |
+
+モデルは匿名で取得可能なpublic/ungated repositoryであり、認証情報を設定・取得していない。Hugging Faceのモデルcacheもモデルディレクトリ内。root/HOMEへモデルを二重取得していない。
+
+### 9.2 初回取得の中断と再開
+
+11:58:40 JSTに、指示書のrootless bootstrapコマンド（`--pull=never` を追加）を起動した。loopback `127.0.0.1:8731` のみ、指定デバイス・keep-groups・host IPC・memlock無制限、モデルRW mount。
+
+**最初の試行は失敗:** SSHコマンド終了後の11:58:51にコンテナが終了コード1で停止・自動削除され、`download FAILED. Nothing was started.` と記録された。取得途中の約192 MiBのcacheだけが残り、完成したモデル本体・GPUロードはなかった。
+
+限定診断で、同じimageのhf CLI 1.28.0、匿名のmetadata取得・モデルHEADがHTTP 200、`hf download --dry-run` の対象3ファイル/118.8 GB（十進）を確認した。追加のモデルダウンロードは行っていない診断である。journalでは同時刻にユーザー用systemdのshutdownと当該libpod scopeの停止があり、`Linger=no` だった。最後のSSH接続終了でユーザーマネージャーが終了し、取得中コンテナが停止したと判断した。
+
+12:03:30 JSTに **中断した同じ初回取得を再開**。`podman run` 後に同じSSH接続で `podman wait halogen-flash-bootstrap` を実行し、ログインセッションを保持した。断片の再利用は公式downloaderの再開機構に委ねたが、実際の再利用byte数は未測定。bootstrap起動は中断分を含め2回であり、1回で成功したとは記録しない。盲目的なループ再試行、別モデル取得、linger設定変更、systemd永続service追加はしていない。
+
+12:28:15 JSTにdownload complete。再開から約24分46秒、終盤の取得ログは平均約80 MB/s（十進、**推論速度ではない**）。モデル本体3個とtokenizerの実サイズ合計は118808753412 bytes（約110.65 GiB）。初回中断由来とみられる201196516 bytesおよび0 bytes×2の `.incomplete` がcacheに残り、削除は行っていない。この残骸を含めても130 GiB以内である。entrypointの `download complete (63G)` はv2本体の表示であり、取得一式のサイズとは区別した。
+
+### 9.3 通常起動スクリプト
+
+`deploy/halogen-flash/run.sh` を新規作成。Ubuntu・一般ユーザー・rootless Podman・mount・必要モデルファイル・GPU権限・memlock・imageの存在と、同名container/8731の未使用を確認してから通常起動する。imageは指定tag固定かつ `--pull=never`、モデルはRO、`HALOGEN_DOWNLOAD` なし。既存containerを停止・置換しない。
+
+**[Windows開発PC → EVO-X2 Ubuntu]** `scp` で `/srv/llm/engines/halogen-flash/run.sh` へ1ファイルのみ転送。転送先の未存在を確認後に配置しmode 0755とした。LF形式、`bash -n` 成功、双方のSHA-256は `5cb53066f338a15cb9c621d0b330998e1ed8da9dcd830d67e07971a9df15d0a9` で一致した。
+
+取得途中にスクリプトを実行し、v2本体の未存在を検出して終了コード1、bootstrap以外のcontainerを作成しないことを確認した。これは意図したガードのPASSであり、モデルロード成功の検証ではない。
+
+### 9.4 モデル照合と通常起動
+
+bootstrapの `/health`・`/v1/models` がHTTP 200、モデルreadyを確認した後、12:29:16 JSTに `podman stop --time -1 halogen-flash-bootstrap` で正常停止した。終了コード0、GTT usedは起動前の18661376 bytesに戻った。`--time -1` は強制killへのtimeoutを無効にする指定である（[Podman公式](https://docs.podman.io/en/latest/markdown/podman-stop.1.html)）。
+
+**[EVO-X2 Ubuntu/SSH]** 停止後にPythonで実ファイルのsizeと全体SHA-256を算出し、Hugging FaceのLFS metadataと照合した。3ファイルすべてPASS、hash計算所要63.73秒。取得metadataが示すrevisionもすべて `cf41ff9fc97b6dd9887d82e21269522de6208055` で一致した。
+
+| ファイル | 実bytes | SHA-256（実測・配布metadata一致） |
+|---|---:|---|
+| `qwen38-flash-next-v2.hgn` | 66687678432 | `71246c6ab3fc1de2cf06326f18e275fe9c2a18366d646ed3357d194c884fc687` |
+| `qwen38-flash-next-ngram.hgn` | 51200246144 | `3450acada94e19aabad88bd49b45eb70304820949c2240fc178067b20ae5dffe` |
+| `qwen38-flash-next-vision.hgn` | 897916416 | `d62e0ae553fe88afd3833733d4a4c669f34d20fd8dfce4b9610525bed2134b10` |
+
+tokenizerは `chat_template.jinja` 8952、`generation_config.json` 202、`merges.txt` 3353259、`tokenizer.json` 12809320、`tokenizer_config.json` 17928、`vocab.json` 6722759 bytes。実測したchat template SHA-256は `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041`、tokenizer.jsonは `0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3`。
+
+12:30:21 JSTに配置済みrun.shで通常container `halogen-flash` を起動し、同じSSHで `podman wait halogen-flash` によりセッションを保持した。inspectで `/models` のRW=false、memlock Soft/Hard=-1、HostIp=127.0.0.1/HostPort=8731、`HALOGEN_DOWNLOAD` の不在を確認した。APIプロセスはcontainer内で0.0.0.0:8731にlistenするが、ホストへの公開は127.0.0.1だけである。
+
+- 通常起動ログ: weights pinned 62.11 GiB、所要5.8秒、model readyまで7.7秒、engine listeningまで10秒。API/engine双方0.18.4。取得・hash直後のpage cacheが温まった条件であり、cold bootのロード時間ではない。
+- bootstrap側はweights pin 7.0秒、model ready 9.2秒、engine listening 12秒だった。
+- GPU/バックエンド: 公式imageの `HALOGEN_ARCH=gfx1151`、ホストamdgpu/KFD、指定GPUデバイスを使用。ホストに別ROCm一式は導入していない。コンテナ内ROCmライブラリの詳細版は採取していない。
+- 標準v2 HGNはcheckpoint内にprecision選択を持つと起動ログが報告。quality sidecar適用なし。量子化の変更や内部bit幅の再設定はしていない。
+- context=262144、4 slots、共通KV pool=524288 positions、MAX_TOK/PREFILL_CHUNK=32768。ログ上のメモリ内訳はweights 62.1 GiB + KV pool 14.4 GiB + working 12.5 GiB = 89.0 GiB。47.7 GiBのngram表は必要時にfile cacheから読む。
+- memlock上限無制限とGPUへのpin成功を確認した。`HALOGEN_WEIGHTS_LOCK` は設定しておらず、Linuxの明示的なmlockを別途有効化したとは扱わない。起動ログ自身が、MemAvailableはGPU登録済みweightsをreclaimableとして約62 GiB過大に数える場合があると注意しており、実際に他用途へ使える空きは単純な `free` の値とは異なる。
+- prompt cache=2、MTP depth-2（up to 3）既定有効。healthはprompt cacheのwarm/coldがbitwise-identicalではないと報告した。出力同等性やMTP有無の比較は実施していない。
+- visionファイルは取得したがtowerはロードしておらず、healthでvision=false。画像推論は未実施。
+- imageに含まれる既定のengine watchdogは起動ログに存在する。独自watchdog・daemon・serviceは追加していない。FastAPIの `on_event` DeprecationWarningが出たが、起動とAPI検証は成功した。
+
+### 9.5 Thinking ONのAPI検証と実測
+
+**[EVO-X2 Ubuntu/SSH]** Python標準ライブラリのHTTP clientから `http://127.0.0.1:8731/v1/chat/completions` へ逐次送信。いずれもmodel=`halogen-qwen3.8-flash-next`、`enable_thinking=true`、`max_completion_tokens=4096`、stream=false。最初の2回はreasoning_effort=low/temperature=0でseed未指定、top_p/top_kも未指定（greedy）。最後の1回だけxhigh/temperature=1.0/top_p=0.95/top_k=20/seed=42。クライアントtimeoutは各180秒で、すべて数秒で正常完了した。
+
+| 検証 | HTTP / finish_reason / 最終回答 | input / completion（うちreasoning）tokens | pp tok/s | tg tok/s | prompt / generation ms | wall秒 |
+|---|---|---:|---:|---:|---:|---:|
+| 初回low、12人の握手の組合せ | 200 / stop / 66回、12×11÷2の説明。PASS | 78 / 121（88） | 175.557 | 69.429 | 444.3 / 1742.8 | 2.224 |
+| 再リクエストlow、りんご17個を5人に配る | 200 / stop / 一人3個、余り2個。PASS | 70 / 104（74） | 313.199 | 70.157 | 223.5 / 1482.4 | 1.720 |
+| 追加xhigh、赤2青1から非復元で2個取る同色確率 | 200 / stop / 1/3、組合せの説明。PASS | 101 / 315（273） | 420.133 | 61.456 | 240.4 / 5125.6 | 5.373 |
+
+全応答に非空の `reasoning_content` と日本語の最終回答、usage、timingsがあった。reasoning_contentは312/278/421文字だったが、生の思考内容はレポートへ保存しない。3問の最終回答の計算内容も確認した。length終了、空回答、Thinkingのみの応答はなかった。tgはThinkingを含むcompletion全体に対するserverの `predicted_per_second` であり、最終回答だけの速度ではない。wallはHTTP要求開始から全応答受信までのclient実測。非streamのためTTFTは未測定であり、prompt_msをTTFTと呼ばない。
+
+MTPのdraft/acceptedは初回104/78、再リクエスト91/69、xhigh233/171。timingsのcache_nは全件0、2回目/3回目のprefix_nは33/9。短い日本語の計算問題3件・逐次実行・ロード後のwarm条件の参考値であり、長文創作・分析/ツール利用の品質や持続速度、Windows実測との厳密な倍率を結論にしない。
+
+通常containerの `/health` と `/v1/models` はHTTP 200、status=ok、engine.responds=true、API/engine版一致、chat template thinking_control=true/probe passed、model id一致。検証後もbusy=false/in_flight=0/queued=0だった。
+
+**[Windows開発PC]** 30秒で自然終了するSSHに `-L 127.0.0.1:18731:127.0.0.1:8731` を付け、Windowsの `Invoke-RestMethod` でhealth/modelsの同じ正常応答を確認した。転送終了後にWindows側18731のlistenなしを確認。最初に試したStart-Process/Stop-Processを組み合わせる一時トンネル用コマンドは実行前に自動承認レビューで拒否されたため実行されておらず、上記の自然終了する方式で検証を完了した。
+
+### 9.6 終了状態・PASS/FAIL/未実施
+
+通常起動スクリプトを稼働中に再度実行すると、既存同名containerを検出して終了コード1、container ID不変だった（既存保護ガードPASS）。検証後の12:32:58〜12:32:59 JSTに `podman stop --time -1 halogen-flash` で正常停止し、waitは終了コード0だった。
+
+| 項目 | 結果・最終状態 |
+|---|---|
+| A4 / Phase B開始gate | PASS。UMA変更を再確認し、対象1名のmemlockを設定・継承確認 |
+| 最初のbootstrap | FAIL。SSH終了に伴うユーザーマネージャー終了で中断。原因確認後、SSHを保持して同じ初回取得を再開 |
+| 取得・実ファイル照合 | PASS。指定v2一式、公開ハッシュと一致、130 GiB以内 |
+| 通常起動・health/models・Thinking ON日本語3件 | PASS。モデルRO/download無効、低い品質条件への変更なし |
+| WindowsからのSSH転送 | PASS。一時転送だけ、終了済み |
+| 正常停止・GPU返却 | PASS。bootstrap/通常双方終了コード0。最終GTT used=18661376 bytesで開始時と一致、container一覧空、8731 listenなし |
+| ホスト状態 | 終了時MemAvailable約119 GiB、swap使用276 KiB。12:28以降のkernelログをGPU error/fault/reset/OOMのパターンで限定確認し該当なし。全イベントの不存在を保証する検査ではない |
+| ディスク | `/srv/llm` 使用115 GiB/空き659 GiB、root空き82 GiB。モデルディレクトリ約111 GiB、Podman graphroot約3.4 GiB、pull tmp約4 KiB |
+| 恒久稼働・自動復旧 | 未実施。`Linger=no` のまま。推論engineは**配置済み・検証成功・正常停止中** |
+| 追加評価 | 長文/長context、tool calls、並列負荷、耐久試験、MTP有無の品質比較、画像入力、27B Dense/NPUは未実施 |
+
+通常ユーザーの `du` はrootless image内部のUID所有ディレクトリ2箇所でpermission deniedとなった。停止操作自体はその前に成功済みであり、サイズ確認だけを `podman unshare du` で読み取り直して成功した。所有権・権限は変更していない。
+
+## 10. 一時利用と追加状態の切戻し
+
+以下は通常利用・後日の切戻し手順である。削除・設定切戻しは今回実行していない。
+
+### 10.1 SSHを保持した一時利用
+
+今回 `Linger=no` を変更していないため、`-d` のrootless containerだけでSSH切断後も稼働し続けるとは保証しない。次のように**同じSSH接続を開いたまま**利用する。8731をWindows側ですでに使っている場合は左側のローカルportを別の空き番号にする。
+
+```powershell
+# [Windows開発PC] 対話SSHとローカル転送。利用中はこの接続を保持する。
+ssh -L 127.0.0.1:8731:127.0.0.1:8731 evox2
+```
+
+```bash
+# [EVO-X2 Ubuntu / 上の対話SSH内]
+/srv/llm/engines/halogen-flash/run.sh
+# 別のWindows端末/クライアントから http://127.0.0.1:8731/v1 を利用する。
+# リクエスト完了後に正常停止する。-1は強制killへのタイムアウトを無効にする。
+podman stop --time -1 halogen-flash
+# 停止が固まる場合は別SSHで読み取り診断し、強制killやrebootをせず報告する。
+```
+
+API公開はホストloopbackのみ。認証を追加しておらず、LAN/WANの無認証公開やSSH/firewall変更はしていない。ログアウト後の継続稼働、OS再起動時の自動起動、systemd永続service化は本タスクの成果に含めない。Windows checkoutから後日再転送する場合も、shell scriptの改行をLFで保持し、Ubuntuで `bash -n` とハッシュを確認する。
+
+### 10.2 追加した永続状態と削除範囲
+
+前回の第3.4節・第5節に加え、今回の追加状態は以下。
+
+- `/etc/security/limits.d/90-evox2-halogen-memlock.conf`。不要になった場合は、内容が本タスクの対象1名・memlock2行のままであることを確認して、この専用ファイルだけを削除し、新たなSSHログインで旧上限を確認する。現在のプロセスの上限は削除だけでは変わらない。既存PAM等は触らない。
+- `/srv/llm/models/halogen-flash` 内の指定モデル・tokenizer・Hugging Faceの取得metadata/cache。削除時は当該container停止と他用途がないことを確認し、このディレクトリの今回の取得物だけを対象にする。モデル本体はGit管理外。
+- `/srv/llm/engines/halogen-flash/run.sh`。転送した1ファイルだけが対象。
+- 専用graphroot内の指定image（上記digest/ID）とPodman管理状態。一時診断containerは `--rm` で終了した。imageを削除する場合は依存containerや別用途がないことを確認し、当該imageだけを `podman image rm` の対象にする。全体reset/pruneはしない。
+- system journalには取得・起動・検証の通常ログが残る。ログ削除、HF認証情報の保存、追加パッケージ導入はしていない。
+
+memlock無制限により大容量メモリのロックが可能になる。並行する大きなGPU負荷やメモリ圧迫時のOOMを本検証で評価したものではない。
+
+## 11. 再開分の成果物・残課題
+
+- tracked変更は `deploy/halogen-flash/run.sh` の新規作成（実行可能）と本レポートへの追補の2ファイルだけ。承認済み指示書・AGENTS.mdは変更しない。
+- 本文確定後に対象差分、機密情報、`git diff --check`、stage範囲を確認し、commit/pushする。実際のSHAと `origin/main` 包含確認結果は最終チャットで報告する（自己commit SHAの本文への自己参照は行わない）。
+- 初回導入の成功条件は達成した。今回の最終状態は停止中であり、ユーザーが第10.1節のSSHを保持する手順で一時利用できる。ログアウト後の継続稼働やsystemdへの昇格は、別途設計・承認が必要。
+- 短いAPI疎通の結果だけで本格的な品質・性能の優位を判断しない。Flash-Nextの分析・ツール利用・長文context、長時間安定性、Windowsベースラインとの条件を揃えた比較は次工程の判断対象。TTFT、cold bootロード時間、コンテナ内ROCmの詳細版、モデル内部precisionのbit幅内訳は未確認。
+- 小さい取得中断cache（約192 MiB）が残る。モデル本体は完全に照合済みであり、この残骸は未完成モデルを使用しているという意味ではない。不要ファイルの削除は今回実施していない。
+- 新たに参照した公式資料: [Halogen host setup](https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/host-setup.md)、[API](https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/api.md)、[troubleshooting](https://github.com/peonist-ai/halogen-flash-server/blob/main/docs/troubleshooting.md)、[engine license](https://github.com/peonist-ai/halogen-flash-server/blob/main/LICENSE.md)、[model card](https://huggingface.co/peonist-ai/halogen-qwen3.8-flash-next)、[model revision](https://huggingface.co/peonist-ai/halogen-qwen3.8-flash-next/tree/cf41ff9fc97b6dd9887d82e21269522de6208055)。実際に稼働した版・設定は上記image/実ファイルhash/実機ログを根拠とし、mainの将来の変化と区別する。
