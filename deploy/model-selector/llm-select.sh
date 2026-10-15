@@ -33,7 +33,7 @@ qhash() {
 dhash() {
     case "$1" in
         flash) echo 790f8cc28a2c035c32a9436745bd946f00dc2ea9c088d5c5851cbface958605e ;;
-        dense) echo 85a0498391669910604ae207b180edacb149af5deb1bdfbcefbc5f3a4ee46a23 ;;
+        dense) echo 6586664d17de8b7a888002fcd382012974219c1eb2a1d4517436e22fbfaf35f2 ;;
         *) return 1 ;;
     esac
 }
@@ -85,7 +85,12 @@ unit_ok() {
     [[ $(value Restart) == no && $(value NRestarts) == 0 ]] || return 1
     [[ $(value TimeoutStopUSec) == infinity && $(value SendSIGKILL) == no ]] || return 1
     [[ $(value KillMode) == mixed && $(value LimitMEMLOCK) == infinity ]] || return 1
-    [[ -z $(value SuccessExitStatus) && $(value Type) == notify ]] || return 1
+    [[ $(value Type) == notify ]] || return 1
+    case "$model" in
+        flash) [[ -z $(value SuccessExitStatus) ]] || return 1 ;;
+        dense) [[ $(value SuccessExitStatus) == 143 ]] || return 1 ;;
+        *) return 1 ;;
+    esac
     expected=$(QUADLET_UNIT_DIRS="$base/templates/$model" "$generator" --user --dryrun 2>/dev/null) || return 1
     expected=$(printf '%s\n' "$expected" | sed -n 's/^ExecStart=//p')
     [[ -n "$expected" && "$expected" != *$'\n'* ]] || return 1
@@ -117,6 +122,16 @@ assert arguments(sys.argv[1]) == arguments(sys.argv[2])
     [[ " $wants " == *" $unit "* ]] || return 1
     [[ $(readlink "$XDG_RUNTIME_DIR/systemd/generator/default.target.wants/$unit") == "../$unit" ]] || return 1
     systemd-analyze --user --generators=true verify "$unit" || return 1
+}
+
+stop_commands_ok() {
+    local property record
+    # ExecStopPost ignores errors at unit level; check its actual exit separately.
+    for property in ExecStop ExecStopPost; do
+        record=$(value "$property") || return 1
+        [[ "$record" == *' ; code=exited ; status=0 }' &&
+           "$record" != *'} {'* && "$record" != *'pid=0 ;'* ]] || return 1
+    done
 }
 
 gtt() { cat "$gtt_file"; }
@@ -326,8 +341,10 @@ container_exit=$(podman events --stream=false --since "$stop_since" \
     fail 'container終了イベントを取得できません。設定変更・再起動を行いません。'
 systemctl --user show "$unit" -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p ExecStop -p ExecStopPost
 say "container exit=$container_exit / GTT after=$(gtt) bytes"
-[[ $(value ActiveState) == inactive && $(value Result) == success ]] || fail 'systemdが正常停止を報告していません。143を成功扱いに変更せず保留します。'
+[[ $(value ActiveState) == inactive && $(value Result) == success ]] || fail 'systemdが正常停止を報告していません。終了コードだけで成功扱いせず保留します。'
+stop_commands_ok || fail 'ExecStop/ExecStopPostの正常終了を確認できません。設定変更・再起動を行いません。'
 [[ "$container_exit" == 0 || ( "$original" == dense && "$container_exit" == 143 ) ]] || fail '想定外のcontainer終了コードです。'
+[[ $(value ExecMainCode) == 1 && $(value ExecMainStatus) == "$container_exit" ]] || fail 'systemdとcontainerの終了状態が一致しません。'
 empty_runtime || fail 'container/port/GTTが解放されていません。設定変更・再起動を行いません。'
 safe_stop=1
 templates_ok && [[ $(identify) == "$original" ]] || fail '停止中に設定が変更されました。'

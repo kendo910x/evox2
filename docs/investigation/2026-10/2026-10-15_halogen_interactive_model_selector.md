@@ -1,6 +1,8 @@
 # Halogen 対話式モデル選択・再起動切替 実施レポート
 
-## 1. 結論・現在状態
+> **最新状態（2026-10-15、承認後の再開）: `PASS`。Dense専用の143許容と停止結果の個別検査を反映し、残り1回の再起動でFlashのログイン前自動起動・LAN8731・Thinking ONを確認した。Flash active/running、Dense停止。再起動は初回分と合計2回。詳細は第11節。第1〜10節は17:58時点の中断履歴であり、現在状態ではない。**
+
+## 1. 初回実施時の結論・中断状態
 
 **状態: `BLOCKED_DENSE_SYSTEMD_EXIT_143`。実装・Flash→Denseの自動起動検証は完了したが、往復の受入は未完了。** Dense→FlashのTTY Yes後、Denseのsystemd停止が`failed / Result=exit-code / ExecMainStatus=143`になったため、指示書A2・Phase Bの停止条件に従って保留した。`SuccessExitStatus`を追加して成功扱いにする変更はしていない。
 
@@ -204,3 +206,115 @@ selectorはResult=successを要求するためここで拒否し、force kill、
 指定の4つのtracked pathだけを明示的にstageし、selectorの実行属性、LF、対象差分、`git diff --check`、秘密情報混入を確認する。無条件`git add -A`、force push、history rewriteは行わない。自己commit SHAとpush・origin/main包含・最終cleanの実確認は最終チャットで報告する。
 
 本レポートは部分完了の証跡である。Flash復帰や往復受入完了を成功扱いにしない。
+
+## 11. 承認後の再開: Dense停止判定修正・Flash自動復帰
+
+### 11.1 承認・開始時の確認
+
+- 再開日: 2026-10-15。実機反映・受入は18:09〜18:16 JST、以後レポート・最終確認・Git反映。実行主体は同じWindows開発PCのCodex、実機操作はSSH alias `evox2`経由。
+- 指示の基礎は第2節の指示書commit。追加の承認はこのチャットのユーザーによる「提案された修正と残り1回の再起動を承認します」という明示指示。Dense専用`SuccessExitStatus=143`、selectorのhash/実効値検査更新、Dense通常起動、既存UIのFlash選択・Yes、全停止条件成立後の残り1回のrebootを承認した。Flash正本と親user managerの変更は引き続き禁止。
+- `AGENTS.md`を先に読み、元の指示書の停止・再起動条件と前回レポート・実装を確認した。開始branch=`main`、HEAD=`48e0deca1388d205dd26b0bcf121a04eafe38a77`、clean。fetch後もorigin/mainと一致し、既存差分・競合はなかった。
+- 18:09:44 JSTに同一ホスト・非rootユーザー・Linux用mount・kernel・sudoを最小限確認。Dense選択、unit failed / Result=exit-code / ExecMainStatus=143 / MainPID=0、全container不在、8731/8732閉鎖、**GTT=18,661,376 bytes / busy=0%**で前回状態と一致した。
+- 配置済みselector、両モデルテンプレート、active対のSHA-256が前回commitと一致。Linger=yes、memlock unlimited、親managerの5秒期限・KillMode=mixed・SendSIGKILL=yes・vendor drop-inは不変だった。モデル再hash、再ダウンロード、パッケージ再導入はしていない。
+
+### 11.2 変更差分・実機反映
+
+変更したtracked fileは **Dense stop drop-in、selector、本レポートの3件だけ**。Dense Quadlet、Flashの全trackedファイル、両モデルの既存run.shは変更していない。
+
+Dense専用`90-safe-stop.conf`に次の2行だけを追加した。
+
+```ini
+# Dense 0.1.4 returns 143 on TERM; selector still verifies stop and GPU release.
+SuccessExitStatus=143
+```
+
+selectorはDense stopの固定hashを更新し、実効`SuccessExitStatus`がDenseでは厳密に`143`、Flashでは空であることを検査する。さらに停止後は既存のinactive / Result=success判定に加え、以下を要求する。
+
+- ExecStopとExecStopPostが実際に実行され、各`code=exited / status=0`であること。ExecStopPostはunit側がignore_errors=yesのため、Resultだけで後処理成功を推定しない。
+- containerのdiedイベントがFlashは0、Denseは0または143であり、systemdのExecMainCode=exited / ExecMainStatusとも一致すること。
+- 従来どおりcontainer不在・両port閉鎖・GTT基準付近への返却・GPU busy=0。143という数値だけで設定更新やrebootを許可しない。
+
+| 更新ファイル | 新SHA-256 |
+|---|---|
+| Dense stop | `6586664d17de8b7a888002fcd382012974219c1eb2a1d4517436e22fbfaf35f2` |
+| selector | `570823a8d141e2d7a261208d3c8185054354243c6b8d7961c08f80a118fb1f7f` |
+
+**[Windows→EVO-X2 Ubuntu]** 新版をselector配置先の一時ファイルへ転送、`bash -n`とhashを確認した。既存ディレクトリにflockを取り、旧active対・failed状態・GTT解放を再確認してからDenseテンプレートstopとactive stop、selectorを更新した。旧stop/scriptを一時退避し、activeと同じディレクトリの一時ファイルからrenameした。Dense Quadlet自体は同じhashのまま。`systemctl --user daemon-reload`とselectorの実効unit検査、`systemd-analyze --user --generators=true verify`が成功した後、今回だけの退避を除去した。
+
+実効SuccessExitStatus=143、Restart=no、LimitMEMLOCK=infinity、非強制ExecStop/ExecStopPost、default.target登録を確認。失敗履歴を`reset-failed`で消す操作はしていない。
+
+### 11.3 変更箇所の検証とDense通常起動
+
+`bash -n`はPASS。実機設定のread-only照合でDenseの143を受理し、Flashとして143を受理しないこと、Denseで143が未設定なら拒否することを確認した。前回と同じ隔離fixture方式で変更した停止条件を6ケース確認し、全件PASS。
+
+| 隔離ケース | 期待した結果 |
+|---|---|
+| Dense143＋Result=success＋両停止コマンド0＋GTT解放 | Flash対への切替とreboot呼出を許可 |
+| 143でもsystemdのResultが失敗 | 設定変更・rebootを拒否 |
+| Dense143でもGTT未解放 | 設定変更・rebootを拒否 |
+| ExecStop失敗 | 設定変更・rebootを拒否 |
+| ignore_errors対象のExecStopPost失敗 | 設定変更・rebootを拒否 |
+| systemdとcontainerの終了値不一致 | 設定変更・rebootを拒否 |
+
+上記は一時ディレクトリ内の偽runtimeによる検証であり、実機GPUやサービスへの障害注入ではない。fixtureは自動削除済み。UIのNo/Cancel処理は変更しておらず、前回の実TTY無変更検証を再利用した。
+
+**18:13:02 JST**、もう一度container/port不在とGTT解放・Dense unit整合を確認し、承認どおり`systemctl --user start halogen-active.service`でDenseを通常起動した。手動run.shは使っていない。active/running、Result=success、NRestarts=0、container内memlock soft/hard unlimited。
+
+18:13:07にはWindowsからLAN8732のhealth/modelsが正常応答。api=engine=0.1.4、model=`halogen-qwen3.8-27b`、context=262144、slots=1、DFlash2、busy=false / in_flight=0 / queued=0。モデル/image、RO mount、port、containerのconmonとservice MainPID一致を含む実機preflightもPASS。Denseの創作・速度ベンチは繰り返していない。
+
+### 11.4 UIからDense停止・Flash選択・最後の再起動
+
+別の作業SSH session・APIの確立済み接続がないことを確認し、`ssh -t evox2 llm-select`を起動。画面の現在選択DenseからFlashへSpace/Tab/OKで変更し、Reboot画面の初期Noから**Yesへ明示的に移動してEnter**した。確認迂回オプション・手動ファイル切替は使っていない。
+
+セレクターがboot先・unit・idleを再検査し、**18:14:02 JST**にsystemd経由でDenseを停止した。
+
+| 必須条件 | 実測・判定 |
+|---|---|
+| `systemctl --user stop` | 終了コード0 |
+| unit結果 | **inactive/dead / Result=success** |
+| ExecStop | podman stop --ignore --time=-1 halogen-dense、code=exited / status=0 |
+| ExecStopPost | 専用label＋Dense完全一致名による非強制rm、code=exited / status=0 |
+| 主プロセス・container | ExecMainCode=1（exited）、ExecMainStatus=143、diedイベント=143。一致 |
+| GTT | **21,176,967,168 → 18,661,376 bytes** |
+| その他の解放 | container一覧空、8731/8732閉鎖、GPU busy=0% |
+| journalの停止経過 | Stopping 18:14:02.277894 → Stopped 18:14:02.523391、約0.245秒。今回の停止にMain process failed/Failed with resultログなし |
+
+**すべての条件が成立してから**Flash正本のQuadletとstopを対で設置し、daemon-reload、生成unitとFlash stop両方、SuccessExitStatus空、Restart=no、default.targetを照合。もう一度空runtimeとGTTを確認した後、`sudo -n reboot`を1回実行した。今回の再起動は **1回、前回分と通算2回**。3回目や予備のrebootは行っていない。
+
+143は承認されたDenseのTERM時終了分類として扱った。engine/APIの全内部cleanupを証明したという主張ではなく、systemd成功・停止コマンド成功・実リソース返却の全条件を実測した結果である。強制kill/force rmや親managerへの変更はない。
+
+### 11.5 Flashのログイン前自動起動・LAN API
+
+reboot後に手動startは実行していない。SSHを開く前にWindowsからLAN8731へ接続し、**18:15:33 JST**にhealth/models正常応答を確認した。その後の最初のSSHは18:16:27。
+
+| 事象 | bootからの秒 |
+|---|---:|
+| Flash service開始 | 6.087 |
+| active | 6.536 |
+| engine model ready | 51.039 |
+| API listen / startup complete | 53.819 |
+| 最初のSSH session | 135.229 |
+
+**APIはSSHより約81.410秒早く起動**し、LANからのHTTPもログイン前に成功した。coldロードでservice activeからAPI readyまで時間を要する点を区別し、初期のHTTP未readyを手動startで補っていない。
+
+active対はFlash正本の既存hashに戻った。Quadlet=`cb6c6357066d68a0a7a8a035c8b61de8950ffa8847665b4bae23689c8ec03446`、stop=`790f8cc28a2c035c32a9436745bd946f00dc2ea9c088d5c5851cbface958605e`。現在のSuccessExitStatusは空で、Dense用143はFlashに残っていない。
+
+Flashのみactive/running、Result=success、NRestarts=0、Restart=no、Linger=yes。containerはFlashだけ、8731 listen、Dense containerなし/8732閉鎖。user manager実プロセスとcontainerのmemlockはunlimited。親managerの5秒期限・KillMode・SendSIGKILL・vendor drop-inは開始時と一致し、変更していない。
+
+healthはmodel=`halogen-qwen3.8-flash-next`、api=engine=0.18.4、engine.responds=true、Thinking control=true。context=262144、slots=4、KV pool=524288、prompt cache mode=2、MTP depth-2、既存checkpoint/量子化を維持。boot後のselectorによるFlash unit/runtime照合もPASS。
+
+**[Windows開発PC] Thinking ON日本語API:** LAN8731へSSH転送・proxyなしで前回と同じ「りんご17個を5人へ配る」短問を送信した。enable_thinking=true、reasoning_effort=low、temperature=0、max_completion_tokens=4096、stream=false、top_p/top_k/seedはリクエスト未指定。
+
+HTTP正常応答、finish_reason=stop、回答「一人3個、余り2個です。」、非空reasoning_content=180文字で **PASS**。input=74、completion=68（reasoning=56）tokens、prompt=435.1 ms / generation=1033.9 ms、**pp=170.076 tok/s / tg=65.770 tok/s / Windows wall=1.583秒**。MTP draft=55 / accepted=43、cache_n=0。tgはThinkingを含む生成全体、TTFTは非streamのため未測定。server既定のThinking effortを変更したものではなく、長文品質・持続性能の再評価でもない。
+
+### 11.6 完了判定・残る制約・Git
+
+**承認された再開分はPASS。** Dense専用143設定、停止結果の個別照合、Dense通常起動、TTYによるFlash選択、全停止条件成立後の最後のreboot、Flashのログイン前自動起動、LAN8731/Thinking ON、Dense停止まで完了した。前回のFlash→Dense自動起動実証と合わせ、往復受入を完了した。
+
+**最終実機確認は18:19:23 JST。** 操作SSH終了後の新規接続でも、Flashの同じcontainer・MainPID・起動時刻を維持し、active/running / Result=success / NRestarts=0 / health ok / idleだった。実`flash_serve`プロセスのmemlockもunlimited、container OOMKilled=false。Dense containerなし、8732閉鎖。現在bootのkernel journalで限定したOOM/amdgpuエラー検索は該当0。Flash/Dense両run.shとFlashテンプレートhashは不変、転送・切替用の一時ファイル残骸もなかった。
+
+現在の利用方法は`ssh -t evox2 llm-select`。取消時は変更を適用せず、切替失敗時は無条件にrebootしない。第9節の撤去手順はFlash復帰後の現在にも適用できる。今回追加の一時転送・退避ファイルは除去済みで、残る追加状態は更新したselector/Dense stopテンプレートと通常journalのみ。新規パッケージ・モデル・image・常駐サービスは追加していない。
+
+残る制約は、Denseの予期しない143終了も当該unitではsuccess分類になること、明示的なengine/API全cleanupログが得られないこと、idle検査と新規HTTP到着の競合、突発shutdown時の親managerの5秒期限。第5節の初回Flash複合gate不成立の内訳も未確定の履歴として残す。これらを解消したとは主張せず、今回の通常切替・資源返却の成功と区別する。
+
+対象3ファイルだけをstageし、差分・LF・hash・実行属性・秘密情報・`git diff --check`を確認してcommit/pushする。Flash正本、Dense Quadlet/run.sh、指示書・AGENTS.mdに変更はない。今回の自己commit SHA、push結果、origin/main包含・最終cleanは最終チャットで報告する。
