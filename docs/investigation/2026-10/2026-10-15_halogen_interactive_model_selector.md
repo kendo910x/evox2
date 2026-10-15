@@ -1,6 +1,6 @@
 # Halogen 対話式モデル選択・再起動切替 実施レポート
 
-> **最新状態（2026-10-16）: `WAITING_FOR_USER_REBOOT`。ユーザーによる切替がFlash停止後に中断。停止後の観測遅延へ対処する修正版を配置し、Flashを通常起動してLAN8731のhealth/models応答まで復旧した。ただし今回の中断条件は未確定で、修正版による実際のモデル切替・再起動は未検証。前回までに試験上限2回を使用済みのため、追加の往復試験には承認が必要。詳細は第12節。第1〜11節は過去の実施履歴。**
+> **最新状態（2026-10-16 06:46 JST）: `PASS`。追加最大2回の再起動承認を受け、修正版selectorの既存UIからFlash→Dense→Flashの実機往復切替に成功した。両回とも正常停止・GPU解放後に設定対を切り替え、ログイン前自動起動・LAN API・Thinking ONを確認。現在はFlashのみactive/running、Dense停止。今回2回、以前の試験と通算4回の再起動。詳細は第13節。第1〜12節は過去の実施履歴。最初の中断原因が確定したという意味ではない。**
 
 ## 1. 初回実施時の結論・中断状態
 
@@ -405,3 +405,95 @@ Podman 5.7.0の[公式journal読取実装](https://github.com/containers/podman/
 切戻しが必要なら、モデル切替が実行中でないことと現行hashを確認し、selectorだけを前回commitの内容へ戻せる。active Quadlet/stopやモデルに触れる必要はない。旧版へ戻すと今回の観測遅延対処・journal記録も失われる。いずれの版でも稼働中モデル・GPU異常を無視して切り替えない。
 
 selectorと本レポートのみを明示stageし、差分、LF、実行属性、秘密情報、`git diff --check`を確認してcommit/pushする。自己commit SHA・origin/main包含確認は最終チャットで報告する。今回の隔離試験PASSを、実機切替成功へ読み替えない。
+
+## 13. 2026-10-16: 追加承認後の実機往復切替
+
+### 13.1 承認と開始状態
+
+ユーザーは「安全条件を確認しながらFlash→Dense→Flashを追加最大2回の再起動で検証してよいか」という確認に「はいよいです」と明示承認した。この承認で第12節の再起動待ちは解消した。対象・品質・正常停止条件は元指示書と既存のDense143承認を維持する。
+
+- 作業時間: 2026-10-16 06:40〜06:46 JSTに実機検証、以後レポート・Git反映。
+- Windows開始branch=main、HEAD=`5cde8d194fb20be6a3cc78946017a254779e6da9`、clean。`AGENTS.md`を先に読み、fetch後のorigin/main一致、指示書と第12節、実装を確認した。
+- WindowsからSSH alias `evox2`で同一Ubuntuホスト・非rootユーザーを確認。実機selectorのhashは`5e90a54121ac4c543a964948314a1dc2067281d07271e4c28fd1414cd4b8a0f3`、active対はFlash正本と一致。
+- Flash active/running、Result=success、NRestarts=0、health ok/idle、APIの確立済み接続なし。全preflight（boot先、memlock、Linger、image/model、実効unit等）を通過した。操作用SSH以外の作業sessionはなかった。
+- この再開ではコード・恒久設定を追加変更せず、前回配置した修正版をそのまま使用した。変更tracked fileは**本レポートのみ**。
+
+### 13.2 既存UIによる切替と停止条件
+
+いずれもWindows上で`ssh -tt evox2 llm-select`を開き、ラジオ選択をSpaceで確定してOKへ進み、Reboot画面の初期NoからYesへ移動してEnterした。確認を迂回するオプションや手動の設定差替えは使っていない。
+
+| 条件 | 1回目: Flash→Dense | 2回目: Dense→Flash |
+|---|---|---|
+| UI Yes/切替開始 | 06:40:50 JST | 06:44:02 JST |
+| systemd停止開始 | 06:40:51.937826 | 06:44:03.378495 |
+| systemd停止完了 | 06:40:53.093429 | 06:44:03.634118 |
+| 停止所要時間 | 約1.156秒 | 約0.256秒 |
+| systemctl stop | 成功 | 成功 |
+| 停止後systemd | inactive / Result=success / ExecMainCode=1 / ExecMainStatus=0 | inactive / Result=success / ExecMainCode=1 / ExecMainStatus=143 |
+| 対象containerのdiedイベント | 0 | 143 |
+| ExecStop/ExecStopPost | 実行済み・code=exited/status=0の照合PASS | 実行済み・code=exited/status=0の照合PASS |
+| GTT停止前→停止後 | 29,054,521,344 → **18,661,376 bytes** | 21,213,184,000 → **18,661,376 bytes** |
+| 解放確認 | 全container不在、8731/8732閉鎖、GPU busy=0 | 全container不在、8731/8732閉鎖、GPU busy=0 |
+| 設定対の切替・daemon-reload | Dense正本のQuadlet＋専用stopへ切替、実効unit照合PASS | Flash正本のQuadlet＋専用stopへ切替、実効unit照合PASS |
+| reboot直前 | inactive、空runtimeとGTTを再確認 | inactive、空runtimeとGTTを再確認 |
+| OS reboot | 06:40:53頃に要求、06:41:03 boot | 06:44:04頃に要求、06:44:13 boot |
+
+ExecStop/ExecStopPostの成功は、`verify_stopped`内でsystemdの実行recordを照合し、成功後にのみ設定対更新へ進んだ証拠による。reboot後の新しいunitから前bootの実行recordを再取得したという意味ではない。停止結果・container終了値・GTT・選択確認の各段階は、端末出力に加え既存journalのtag `llm-select`へ記録された。
+
+両回とも終了イベント・GPU解放が最初の観測で成立し、今回の実機試験では期限付き再読取りの待機メッセージは発生しなかった。期限付き経路の検証は第12節の隔離試験による。Denseの143だけで成功扱いせず、上記すべての条件成立後にrebootした。
+
+### 13.3 ログイン前の自動起動・モデル分離
+
+再起動後はSSHを開く前にWindowsからLANの対象portへ直接GETし、health/modelsが期待するモデルを返すことを確認した。再起動後に手動startやrun.shを実行していない。
+
+| 項目 | Dense boot | Flash boot |
+|---|---:|---:|
+| unit開始（boot後秒） | 6.222 | 6.141 |
+| unit active（boot後秒） | 6.687 | 6.580 |
+| API listen（boot後秒） | 35.369 | 55.983 |
+| 最初のSSH session（boot後秒） | 89.474 | 73.716 |
+| WindowsのLAN health/models成功 | **06:41:40 JST / 8732** | **06:45:11 JST / 8731** |
+| 最初のSSH | 06:42:32 JST | 06:45:27 JST |
+| 稼働container | halogen-denseのみ | halogen-flashのみ |
+| 他モデル | Flash不在・8731閉鎖 | Dense不在・8732閉鎖 |
+| 実効SuccessExitStatus | 143 | 空 |
+
+両モデルともactive/running、Result=success、NRestarts=0、Restart=no。起動後のselector全preflightもPASSした。Denseはapi/engine=0.1.4、context=262144、slots=1、DFlash2。Flashはapi/engine=0.18.4、context=262144、slots=4、MTP、KV pool=524288、prompt cache mode=2。配置済み正本のimage/checkpoint/RO mount/portを維持した。
+
+user managerとcontainerのmemlock soft/hard unlimitedを確認した。親user managerのTimeoutStopUSec=5s、KillMode=mixed、SendSIGKILL=yes、vendor drop-inは従来どおりで、変更していない。
+
+### 13.4 Thinking ONの日本語APIと実測
+
+**Windows開発PCからLANへ直接POST**。両モデルに同一条件で1リクエストずつ実行した。
+
+- 質問: 「りんご17個を5人に同じ数ずつ配ります。一人何個で、何個余りますか。日本語で簡潔に答えてください。」
+- `enable_thinking=true`、`reasoning_effort=low`、`temperature=0`、`max_completion_tokens=4096`、`stream=false`。
+- top_p/top_k/seedは未指定。モデル・量子化・context・drafterは変更せず、サーバ既定のThinking effortも変更していない。
+
+| 実測 | Dense | Flash |
+|---|---:|---:|
+| HTTP / finish_reason | 200 / stop | 200 / stop |
+| input / completion tokens | 74 / 86 | 74 / 76 |
+| 非空reasoning_content | 275文字 | 190文字 |
+| reasoning tokens内訳 | API usageに内訳なし | 60 |
+| prompt時間 | 447.2 ms | 439.5 ms |
+| generation時間（Thinking含む） | 2104.0 ms | 1123.0 ms |
+| pp | **165.474 tok/s** | **168.373 tok/s** |
+| tg | **40.875 tok/s** | **67.676 tok/s** |
+| Windows wall time | **2.659秒** | **1.655秒** |
+| cache_n | 0 | 0 |
+| 回答内容 | 一人3個、2個余る | 一人3個、余り2個 |
+
+どちらも日本語の正答と非空Thinking出力を確認してPASS。FlashのThinking APIは最初のSSHより前、06:45:22 JSTに完了した。TTFTは非streamのため未測定。これは切替後の最小疎通確認であり、長文創作品質・長context・持続速度やモデル間の優劣を示すベンチマークではない。思考本文・生応答はGitへ保存していない。
+
+### 13.5 最終状態・完了範囲・Git
+
+**06:46:03 JSTの新規SSHで最終確認:** Flashの同じMainPID・containerが継続稼働し、active/running、Result=success、Restart=no、NRestarts=0、Linger=yes。LAN8731 listen、health ok/idle、Dense不在・8732閉鎖。GTT=29,085,544,448 bytes、busy=0%。実`flash_serve`のmemlockもunlimitedだった。
+
+Flash active Quadlet/stop hashは従来正本の`cb6c6357066d68a0a7a8a035c8b61de8950ffa8847665b4bae23689c8ec03446` / `790f8cc28a2c035c32a9436745bd946f00dc2ea9c088d5c5851cbface958605e`と一致。selector hashも開始時と一致。切替・転送用の一時ファイル残骸はなかった。両bootのkernel journalでOOM、GPU reset、ring timeout、amdgpu fault/failed/errorを単語境界付きで検索し、該当なし。
+
+**修正版による実機往復切替・自動起動・Thinking ON APIの受入はPASS。** 再起動は追加承認の範囲で**今回2回**、前回までと通算4回。今回の承認枠は使い切っており、追加のrebootは実行していない。終了時は指定どおりFlash常駐・Dense停止。
+
+残る不確実性は、ユーザーの最初の中断でどの条件が不成立だったかを事後確定できないこと。今回の往復成功を、初回原因の特定や将来の全切替の無条件保証とはしない。idle検査と新規HTTP到着の競合、突然のshutdown時の親manager期限等の既存制約も維持される。再発時は`journalctl -t llm-select`の対象時刻・bootで停止段階を確認できる。
+
+コードの追加変更はなく、本レポートだけを明示stageしてdiff check・秘密情報を確認し、commit/pushする。自己commit SHA、push・origin/main包含・最終cleanは最終チャットで報告する。
