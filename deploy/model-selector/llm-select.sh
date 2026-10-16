@@ -36,6 +36,7 @@ qhash() {
     case "$1" in
         flash) echo cb6c6357066d68a0a7a8a035c8b61de8950ffa8847665b4bae23689c8ec03446 ;;
         dense) echo 52a90d1a9ed70c95c84f42fd8edefa3cd293ef874ef7d048ed7d9166b67b9466 ;;
+        uncensored) echo 6d77e2191301343ccb0b417c662e370f7c91dc9cb1152ef9b5a678261a02288a ;;
         *) return 1 ;;
     esac
 }
@@ -43,24 +44,48 @@ dhash() {
     case "$1" in
         flash) echo 790f8cc28a2c035c32a9436745bd946f00dc2ea9c088d5c5851cbface958605e ;;
         dense) echo 6586664d17de8b7a888002fcd382012974219c1eb2a1d4517436e22fbfaf35f2 ;;
+        uncensored) echo c28e8a2b5b7063a2a7862822ad6e673ab0f6200cc90692df13fafea23a23b313 ;;
         *) return 1 ;;
     esac
 }
 image_id() {
     case "$1" in
-        flash) echo 556c3c8179d8a566cc0ec0a7f7f54f9f3cb8b77e7bc4a4175e7c23ae359ad80a ;;
+        flash|uncensored) echo 556c3c8179d8a566cc0ec0a7f7f54f9f3cb8b77e7bc4a4175e7c23ae359ad80a ;;
         dense) echo 7f87d073e63491e65fcdce6fb52c2faf2ded22229638f4ed2438096b11cb66c6 ;;
         *) return 1 ;;
     esac
 }
 image_name() {
     case "$1" in
-        flash) echo ghcr.io/peonist-ai/halogen-flash-server:0.18.4 ;;
+        flash|uncensored) echo ghcr.io/peonist-ai/halogen-flash-server:0.18.4 ;;
         dense) echo ghcr.io/peonist-ai/halogen:0.1.4 ;;
         *) return 1 ;;
     esac
 }
-port() { case "$1" in flash) echo 8731 ;; dense) echo 8732 ;; *) return 1 ;; esac; }
+port() { case "$1" in flash) echo 8731 ;; dense) echo 8732 ;; uncensored) echo 8733 ;; *) return 1 ;; esac; }
+container_name() {
+    case "$1" in
+        flash) echo halogen-flash ;;
+        dense) echo halogen-dense ;;
+        uncensored) echo halogen-flash-uncensored ;;
+        *) return 1 ;;
+    esac
+}
+model_id() {
+    case "$1" in
+        flash) echo halogen-qwen3.8-flash-next ;;
+        dense) echo halogen-qwen3.8-27b ;;
+        uncensored) echo halogen-qwen3.8-flash-next-uncensored ;;
+        *) return 1 ;;
+    esac
+}
+companion_dir() {
+    case "$1" in
+        flash|uncensored) echo /srv/llm/models/halogen-flash ;;
+        dense) echo /srv/llm/models/halogen-dense ;;
+        *) return 1 ;;
+    esac
+}
 checked_file() {
     [[ -f "$1" && ! -L "$1" ]] &&
         [[ $(stat -c '%u:%a' -- "$1") == "$(id -u):644" ]] &&
@@ -68,14 +93,14 @@ checked_file() {
 }
 templates_ok() {
     local model
-    for model in flash dense; do
+    for model in flash dense uncensored; do
         checked_file "$(qtemplate "$model")" "$(qhash "$model")" || return 1
         checked_file "$(dtemplate "$model")" "$(dhash "$model")" || return 1
     done
 }
 identify() {
     local model
-    for model in flash dense; do
+    for model in flash dense uncensored; do
         if checked_file "$quadlet" "$(qhash "$model")" &&
            checked_file "$dropin" "$(dhash "$model")"; then
             echo "$model"
@@ -87,7 +112,8 @@ identify() {
 
 # Compare every argument; Quadlet's Go maps can reorder independent options.
 unit_ok() {
-    local model=$1 expected actual stop post wants
+    local model=$1 expected actual stop post wants container
+    container=$(container_name "$model") || return 1
     [[ $(value LoadState) == loaded && $(value UnitFileState) == generated ]] || return 1
     [[ $(value SourcePath) == "$quadlet" && $(value DropInPaths) == "$dropin" ]] || return 1
     [[ $(value FragmentPath) == "$XDG_RUNTIME_DIR/systemd/generator/$unit" ]] || return 1
@@ -96,7 +122,7 @@ unit_ok() {
     [[ $(value KillMode) == mixed && $(value LimitMEMLOCK) == infinity ]] || return 1
     [[ $(value Type) == notify ]] || return 1
     case "$model" in
-        flash) [[ -z $(value SuccessExitStatus) ]] || return 1 ;;
+        flash|uncensored) [[ -z $(value SuccessExitStatus) ]] || return 1 ;;
         dense) [[ $(value SuccessExitStatus) == 143 ]] || return 1 ;;
         *) return 1 ;;
     esac
@@ -124,8 +150,8 @@ assert arguments(sys.argv[1]) == arguments(sys.argv[2])
 ' "$expected" "$actual" || return 1
     stop=$(value ExecStop) || return 1
     post=$(value ExecStopPost) || return 1
-    [[ "$stop" == "{ path=/usr/bin/podman ; argv[]=/usr/bin/podman stop --ignore --time=-1 halogen-$model ; ignore_errors=no ; "* ]] || return 1
-    [[ "$post" == "{ path=/usr/bin/podman ; argv[]=/usr/bin/podman rm --ignore --filter label=io.evox2.halogen.service=halogen-active --filter name=^halogen-$model"'$$ ; ignore_errors=yes ; '* ]] || return 1
+    [[ "$stop" == "{ path=/usr/bin/podman ; argv[]=/usr/bin/podman stop --ignore --time=-1 $container ; ignore_errors=no ; "* ]] || return 1
+    [[ "$post" == "{ path=/usr/bin/podman ; argv[]=/usr/bin/podman rm --ignore --filter label=io.evox2.halogen.service=halogen-active --filter name=^$container"'$$ ; ignore_errors=yes ; '* ]] || return 1
     [[ "$stop$post" != *'} {'* ]] || return 1
     wants=$(systemctl --user show default.target --property=Wants --value) || return 1
     [[ " $wants " == *" $unit "* ]] || return 1
@@ -189,9 +215,9 @@ gpu_released() {
 empty_runtime() {
     local containers listeners
     containers=$(podman ps -a --format '{{.Names}}') || return 1
-    listeners=$(ss -H -ltn '( sport = :8731 or sport = :8732 )') || return 1
+    listeners=$(ss -H -ltn '( sport = :8731 or sport = :8732 or sport = :8733 )') || return 1
     [[ -z "$containers" ]] || { say '停止後もcontainerが存在します。' >&2; return 1; }
-    [[ -z "$listeners" ]] || { say '停止後も8731/8732がlistenしています。' >&2; return 1; }
+    [[ -z "$listeners" ]] || { say '停止後も8731/8732/8733がlistenしています。' >&2; return 1; }
     gpu_released
 }
 wait_gpu_released() {
@@ -249,28 +275,29 @@ health_idle() {
 import json, sys
 h=json.load(sys.stdin); m=sys.argv[1]
 assert h["status"] == "ok" and h["context"] == 262144
-assert h["model"] == ("halogen-qwen3.8-flash-next" if m == "flash" else "halogen-qwen3.8-27b")
+assert m in ("flash", "dense", "uncensored") and h["model"] == sys.argv[2]
 assert h["busy"] is False and h["in_flight"] == 0 and h["queued"] == 0
-v="0.18.4" if m == "flash" else "0.1.4"
+v="0.1.4" if m == "dense" else "0.18.4"
 assert h["version"]["api"] == v and h["version"]["engine"] == v and h["version"]["match"] is True
-assert h["slots"] == (4 if m == "flash" else 1)
-assert h["drafter_default"] == ("mtp" if m == "flash" else "dflash2")
-if m == "flash":
+assert h["slots"] == (1 if m == "dense" else 4)
+assert h["drafter_default"] == ("dflash2" if m == "dense" else "mtp")
+if m != "dense":
     assert h["engine"]["responds"] is True
     assert h["kv_pool_positions"] == 524288 and h["prompt_cache"]["mode"] == 2
-' "$1"
+' "$1" "$(model_id "$1")"
 }
 running_idle() {
-    local model=$1 names used expected_gtt
+    local model=$1 names used expected_gtt other container
+    container=$(container_name "$model") || return 1
     [[ $(value ActiveState) == active && $(value SubState) == running && $(value Result) == success ]] || {
         say "稼働前提不成立: $model / ActiveState=$(value ActiveState) SubState=$(value SubState) Result=$(value Result)。停止済みの場合は旧モデルの安全な復旧確認が必要です。" >&2
         return 1
     }
     names=$(podman ps -a --format '{{.Names}}') || return 1
-    [[ "$names" == "halogen-$model" ]] || return 1
-    podman inspect "halogen-$model" | python3 -c '
+    [[ "$names" == "$container" ]] || return 1
+    podman inspect "$container" | python3 -c '
 import json,sys
-c=json.load(sys.stdin)[0]; m,im,p,pid=sys.argv[1:]
+c=json.load(sys.stdin)[0]; m,im,p,pid,companions=sys.argv[1:]
 s=c["State"]
 assert s["Running"] and not any(s[k] for k in ("Paused","Restarting","OOMKilled","Dead"))
 assert str(s["ConmonPid"]) == pid and c["Image"] == im
@@ -278,18 +305,31 @@ assert c["Config"]["Labels"]["io.evox2.halogen.service"] == "halogen-active"
 assert c["HostConfig"]["PortBindings"] == {"8731/tcp":[{"HostIp":"0.0.0.0","HostPort":p}]}
 assert c["HostConfig"]["RestartPolicy"]["Name"] == "no"
 mounts={v["Destination"]:v for v in c["Mounts"]}
-assert mounts["/models"]["Source"] == "/srv/llm/models/halogen-"+m and not mounts["/models"]["RW"]
+assert mounts["/models"]["Source"] == companions and not mounts["/models"]["RW"]
 if m == "dense":
     assert mounts["/tokenizer"]["Source"] == "/srv/llm/models/halogen-dense/tokenizer" and not mounts["/tokenizer"]["RW"]
 assert not any(e.startswith("HALOGEN_DOWNLOAD=") for e in c["Config"]["Env"])
-' "$model" "$(image_id "$model")" "$(port "$model")" "$(value MainPID)" || return 1
+if m == "uncensored":
+    assert set(mounts) == {"/models", "/uncensored"}
+    assert mounts["/uncensored"]["Source"] == "/srv/llm/models/halogen-flash-uncensored/r2" and not mounts["/uncensored"]["RW"]
+    env=dict(e.split("=",1) for e in c["Config"]["Env"])
+    assert env["HALOGEN_CHECKPOINT"] == "/uncensored/qwen38-flash-next-v2-abliterated.hgn"
+    assert env["HALOGEN_NGRAM_TABLE"] == "/models/qwen38-flash-next-ngram.hgn"
+    assert env["HALOGEN_TOKENIZER"] == "/models/tokenizer"
+    assert env["HALOGEN_MODEL_ID"] == "halogen-qwen3.8-flash-next-uncensored"
+    assert not any(k in env for k in ("HALOGEN_MTP_HEAD", "HALOGEN_VISION_TOWER"))
+' "$model" "$(image_id "$model")" "$(port "$model")" "$(value MainPID)" "$(companion_dir "$model")" || return 1
     [[ -n $(ss -H -ltn "sport = :$(port "$model")") ]] || return 1
-    local other=flash
-    [[ "$model" == flash ]] && other=dense
-    [[ -z $(ss -H -ltn "sport = :$(port "$other")") ]] || return 1
+    for other in flash dense uncensored; do
+        [[ "$other" == "$model" ]] && continue
+        [[ -z $(ss -H -ltn "sport = :$(port "$other")") ]] || return 1
+    done
     used=$(gtt) || return 1
-    expected_gtt=29085544448
-    [[ "$model" == dense ]] && expected_gtt=21176967168
+    case "$model" in
+        flash|uncensored) expected_gtt=29085544448 ;;
+        dense) expected_gtt=21176967168 ;;
+        *) return 1 ;;
+    esac
     [[ "$used" =~ ^[0-9]+$ ]] || return 1
     (( used >= expected_gtt - 536870912 && used <= expected_gtt + 536870912 )) || return 1
     [[ $(cat "$busy_file") == 0 ]] || return 1
@@ -304,16 +344,18 @@ preflight() {
     [[ $(loginctl show-user "$(id -u)" --property=Linger --value) == yes ]] || return 1
     [[ $(ulimit -Sl) == unlimited && $(ulimit -Hl) == unlimited ]] || return 1
     for f in /dev/kfd /dev/dri/renderD*; do [[ -r "$f" && -w "$f" ]] || return 1; done
-    for model in flash dense; do
+    for model in flash dense uncensored; do
         [[ $(podman image inspect "$(image_name "$model")" --format '{{.Id}}') == "$(image_id "$model")" ]] || return 1
         for f in tokenizer/tokenizer.json tokenizer/tokenizer_config.json tokenizer/chat_template.jinja; do
-            [[ -r /srv/llm/models/halogen-$model/$f && -s /srv/llm/models/halogen-$model/$f ]] || return 1
+            [[ -r $(companion_dir "$model")/$f && -s $(companion_dir "$model")/$f ]] || return 1
         done
     done
     for f in /srv/llm/models/halogen-flash/qwen38-flash-next-{v2,ngram}.hgn \
              /srv/llm/models/halogen-dense/qwen3.8-27b-p1w4d-d2.hgn; do
         [[ -r "$f" && -s "$f" ]] || return 1
     done
+    f=/srv/llm/models/halogen-flash-uncensored/r2/qwen38-flash-next-v2-abliterated.hgn
+    [[ -f "$f" && ! -L "$f" && -r "$f" && $(stat -c '%s' "$f") == 88737777792 ]] || return 1
     sudo -n true || return 1
     boot=$(sudo -n efibootmgr) || return 1
     [[ "$boot" != *BootNext:* ]] || return 1
@@ -394,16 +436,17 @@ if [[ ${1:-} == --show ]]; then
     exit 0
 fi
 [[ -t 0 && -t 1 && -t 2 && -n ${TERM:-} && $TERM != dumb ]] || fail '対話TTYが必要です: ssh -t evox2 llm-select'
-flash_on=OFF dense_on=OFF
-case "$original" in flash) flash_on=ON ;; dense) dense_on=ON ;; esac
+flash_on=OFF dense_on=OFF uncensored_on=OFF
+case "$original" in flash) flash_on=ON ;; dense) dense_on=ON ;; uncensored) uncensored_on=ON ;; esac
 if ! selected=$(whiptail --title 'Halogen model selector' --default-item "$original" --radiolist \
-    "現在選択中: $original\nService: $unit\nFlash API 8731 / Dense API 8732 (自宅LAN)\n矢印: 移動 / Space: 選択 / Tab: OK・Cancel\n進行中のクライアント処理は切断され得ます。\nNo/Cancel/Escは変更を適用しません。" \
-    19 78 2 flash 'Flash-Next / API 8731' "$flash_on" dense '27B Dense / API 8732' "$dense_on" \
+    "現在選択中: $original\nService: $unit\nAPI 8731 / 8732 / 8733 (自宅LAN・選択中のみ)\n矢印: 移動 / Space: 選択 / Tab: OK・Cancel\n進行中のクライアント処理は切断され得ます。\nNo/Cancel/Escは変更を適用しません。" \
+    21 78 3 flash 'Flash-Next / API 8731' "$flash_on" dense '27B Dense / API 8732' "$dense_on" \
+    uncensored 'Flash-Next Uncensored (r2) / API 8733' "$uncensored_on" \
     3>&1 1>&2 2>&3); then
     say '取消: 変更なし。'
     exit 0
 fi
-[[ "$selected" == flash || "$selected" == dense ]] || fail '不正な選択です。'
+[[ "$selected" == flash || "$selected" == dense || "$selected" == uncensored ]] || fail '不正な選択です。'
 if [[ "$selected" == "$original" ]]; then
     say "現在選択中: $original。変更・再起動なし。"
     exit 0
@@ -429,7 +472,7 @@ if ! running_idle "$original"; then
     say '直前idle確認失敗。モデルは停止しません。' >&2
     exit 1
 fi
-container_id=$(podman inspect "halogen-$original" --format '{{.Id}}')
+container_id=$(podman inspect "$(container_name "$original")" --format '{{.Id}}')
 stop_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 say "正常停止: $original / GTT before=$(gtt) bytes"
 phase=stop-command

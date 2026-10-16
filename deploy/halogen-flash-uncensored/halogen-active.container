@@ -1,0 +1,39 @@
+[Unit]
+Description=Halogen Flash-Next Uncensored r2 inference server
+ConditionPathIsMountPoint=/srv/llm
+
+[Container]
+Image=ghcr.io/peonist-ai/halogen-flash-server:0.18.4
+Pull=never
+ContainerName=halogen-flash-uncensored
+Label=io.evox2.halogen.service=halogen-active
+Volume=/srv/llm/models/halogen-flash-uncensored/r2:/uncensored:ro
+Volume=/srv/llm/models/halogen-flash:/models:ro
+Environment=HALOGEN_CHECKPOINT=/uncensored/qwen38-flash-next-v2-abliterated.hgn
+Environment=HALOGEN_NGRAM_TABLE=/models/qwen38-flash-next-ngram.hgn
+Environment=HALOGEN_TOKENIZER=/models/tokenizer
+Environment=HALOGEN_MODEL_ID=halogen-qwen3.8-flash-next-uncensored
+PublishPort=0.0.0.0:8733:8731
+AddDevice=/dev/kfd
+AddDevice=/dev/dri
+GroupAdd=keep-groups
+Ulimit=memlock=-1:-1
+PodmanArgs=--ipc=host
+
+[Service]
+Restart=no
+LimitMEMLOCK=infinity
+ExecStartPre=/usr/bin/test -d /srv/llm/containers/podman
+# Full SHA-256 is verified at installation; startup only checks the pinned r2 size.
+ExecStartPre=/usr/bin/bash -ec 'file=/srv/llm/models/halogen-flash-uncensored/r2/qwen38-flash-next-v2-abliterated.hgn; test -f "$$file"; test ! -L "$$file"; test -r "$$file"; test "$$(stat -c %%s "$$file")" = 88737777792'
+ExecStartPre=/usr/bin/bash -ec 'for file in qwen38-flash-next-ngram.hgn tokenizer/tokenizer.json tokenizer/tokenizer_config.json tokenizer/chat_template.jinja; do test -r "/srv/llm/models/halogen-flash/$$file"; test -s "/srv/llm/models/halogen-flash/$$file"; done'
+ExecStartPre=/usr/bin/bash -ec 'for node in /dev/kfd /dev/dri/renderD*; do test -r "$$node"; test -w "$$node"; done'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(id -u)" -ne 0; test "$$(ulimit -S -l)" = unlimited; test "$$(ulimit -H -l)" = unlimited'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(/usr/bin/podman info --format "{{.Host.Security.Rootless}}")" = true'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(/usr/bin/podman image inspect ghcr.io/peonist-ai/halogen-flash-server:0.18.4 --format "{{.Id}}")" = 556c3c8179d8a566cc0ec0a7f7f54f9f3cb8b77e7bc4a4175e7c23ae359ad80a'
+# Refuse all running or stopped containers before Quadlet's generated --replace.
+ExecStartPre=/usr/bin/bash -ec 'existing=$$(/usr/bin/podman ps -a --format "{{.Names}}"); test -z "$$existing"'
+ExecStartPre=/usr/bin/bash -ec 'listeners=$$(/usr/bin/ss -H -ltn "( sport = :8731 or sport = :8732 or sport = :8733 )"); test -z "$$listeners"'
+
+[Install]
+WantedBy=default.target
