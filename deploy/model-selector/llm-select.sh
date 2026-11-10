@@ -10,8 +10,6 @@ unit=halogen-active.service
 quadlet="$HOME/.config/containers/systemd/halogen-active.container"
 dropin="$HOME/.config/systemd/user/$unit.d/90-safe-stop.conf"
 generator=/usr/lib/systemd/system-generators/podman-system-generator
-gtt_baseline=18661376
-gtt_tolerance=16777216 # Allow at most 16 MiB above the measured stopped baseline.
 changed=0
 safe_stop=0
 reboot_accepted=0
@@ -202,15 +200,32 @@ wait_container_exit() {
     return 1
 }
 
-gtt() { cat "$gtt_file"; }
-gpu_released() {
-    local used busy
-    used=$(gtt) || return 1
-    busy=$(cat "$busy_file") || return 1
-    say "GPU確認: GTT=$used bytes / busy=$busy%" >&2
-    [[ "$used" =~ ^[0-9]+$ ]] || return 1
-    (( used <= gtt_baseline + gtt_tolerance )) || return 1
-    [[ "$busy" == 0 ]]
+gpu_counter() {
+    local value
+    if [[ -r "$1" ]] && value=$(timeout --kill-after=1s 1s cat -- "$1" 2>/dev/null) &&
+       [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$value"
+    else
+        printf 'unavailable'
+    fi
+}
+
+log_gpu_observation() {
+    local file device= used=unavailable busy=unavailable
+    # Only report counters that can be attributed to the same DRM device.
+    for file in /sys/class/drm/card*/device/{mem_info_gtt_used,gpu_busy_percent}; do
+        [[ -e "$file" ]] || continue
+        if [[ -n "$device" && "$device" != "${file%/*}" ]]; then
+            device=
+            break
+        fi
+        device=${file%/*}
+    done
+    if [[ -n "$device" ]]; then
+        used=$(gpu_counter "$device/mem_info_gtt_used")
+        busy=$(gpu_counter "$device/gpu_busy_percent")
+    fi
+    say "$1 GPU観測: GTT(bytes)=$used gpu_busy_percent=$busy" >&2
 }
 empty_runtime() {
     local containers listeners
@@ -218,25 +233,6 @@ empty_runtime() {
     listeners=$(ss -H -ltn '( sport = :8731 or sport = :8732 or sport = :8733 )') || return 1
     [[ -z "$containers" ]] || { say '停止後もcontainerが存在します。' >&2; return 1; }
     [[ -z "$listeners" ]] || { say '停止後も8731/8732/8733がlistenしています。' >&2; return 1; }
-    gpu_released
-}
-wait_gpu_released() {
-    local deadline=$((SECONDS + stop_observation_seconds)) observation previous=
-    while :; do
-        if observation=$(diagnostics=0; gpu_released 2>&1); then
-            say "${observation#llm-select: }" >&2
-            return 0
-        fi
-        observation=${observation#llm-select: }
-        if [[ "$observation" != "$previous" ]]; then
-            say "$observation / GPU解放を最大${stop_observation_seconds}秒確認します。" >&2
-            previous=$observation
-        fi
-        (( SECONDS < deadline )) || break
-        sleep 0.2
-    done
-    say 'GPU解放の確認期限を超過しました。設定変更・再起動は行いません。' >&2
-    return 1
 }
 
 verify_stopped() {
@@ -260,9 +256,7 @@ verify_stopped() {
         say 'systemdとcontainerの終了状態が一致しません。' >&2
         return 1
     }
-    phase=stop-gpu
-    wait_gpu_released || return 1
-    # Recheck every resource after waiting; a new container/listener is not ignored.
+    phase=stop-runtime
     empty_runtime || return 1
     [[ $(value ActiveState) == inactive && $(value Result) == success ]] || return 1
     [[ $(value ExecMainCode) == "$code" && $(value ExecMainStatus) == "$status" ]] || return 1
@@ -287,7 +281,7 @@ if m != "dense":
 ' "$1" "$(model_id "$1")"
 }
 running_idle() {
-    local model=$1 names used expected_gtt other container
+    local model=$1 names other container
     container=$(container_name "$model") || return 1
     [[ $(value ActiveState) == active && $(value SubState) == running && $(value Result) == success ]] || {
         say "稼働前提不成立: $model / ActiveState=$(value ActiveState) SubState=$(value SubState) Result=$(value Result)。停止済みの場合は旧モデルの安全な復旧確認が必要です。" >&2
@@ -324,16 +318,6 @@ if m == "uncensored":
         [[ "$other" == "$model" ]] && continue
         [[ -z $(ss -H -ltn "sport = :$(port "$other")") ]] || return 1
     done
-    used=$(gtt) || return 1
-    case "$model" in
-        flash) expected_gtt=29669548032 ;; # Measured idle after inference on 0.20.1.
-        uncensored) expected_gtt=29085544448 ;;
-        dense) expected_gtt=21176967168 ;;
-        *) return 1 ;;
-    esac
-    [[ "$used" =~ ^[0-9]+$ ]] || return 1
-    (( used >= expected_gtt - 536870912 && used <= expected_gtt + 536870912 )) || return 1
-    [[ $(cat "$busy_file") == 0 ]] || return 1
     health_idle "$model"
 }
 
@@ -371,41 +355,47 @@ preflight() {
     unit_ok "$original" && running_idle "$original"
 }
 
+restore_file() {
+    local backup=$1 target=$2 digest=$3 tmp
+    tmp=$(mktemp "${target%/*}/.llm-select-restore.XXXXXX") || return 1
+    # Keep the original backup until the whole pair and the restored unit verify.
+    if cp -p -- "$backup" "$tmp" && checked_file "$tmp" "$digest" && mv -fT -- "$tmp" "$target"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
 cleanup() {
-    local rc=$? restored=1 f
-    trap - EXIT HUP INT TERM
+    local rc=$? f
+    trap - EXIT
+    trap '' HUP INT TERM
     set +e
     if (( diagnostics && rc != 0 )); then
         say "切替未完了: phase=$phase exit=$rc changed=$changed safe_stop=$safe_stop。切替成功として扱いません。" >&2
     fi
-    if (( changed && ! reboot_accepted )); then
-        if [[ $(value ActiveState) != inactive ]] || ! empty_runtime; then
+    if (( safe_stop && ! reboot_accepted )); then
+        if [[ $(value ActiveState) != inactive || $(value Result) != success ]] || ! empty_runtime; then
             say "復元保留: runtime状態が変化しました。設定を重ねず退避を保持: $backup_q $backup_d" >&2
             exit 1
         fi
-        say '切替中断: 旧Quadletと停止設定を対で復元します。' >&2
-        # Backups stay in the destination directories, on the same filesystems.
-        mv -fT -- "$backup_q" "$quadlet" || restored=0
-        mv -fT -- "$backup_d" "$dropin" || restored=0
-        if (( restored )) && [[ $(identify) == "$original" ]]; then
-            systemctl --user daemon-reload || restored=0
-            unit_ok "$original" || restored=0
-        else
-            restored=0
+        if (( changed )); then
+            say '切替中断: 旧Quadletと停止設定を対で復元します。' >&2
+            if ! checked_file "$backup_q" "$(qhash "$original")" ||
+               ! checked_file "$backup_d" "$(dhash "$original")" ||
+               ! restore_file "$backup_q" "$quadlet" "$(qhash "$original")" ||
+               ! restore_file "$backup_d" "$dropin" "$(dhash "$original")" ||
+               [[ $(identify) != "$original" ]] || ! systemctl --user daemon-reload; then
+                say "復元失敗。退避を保持: $backup_q $backup_d" >&2
+                exit 1
+            fi
         fi
-        if (( ! restored )); then
-            say "復元失敗。再起動/別モデル起動は禁止。退避: $backup_q $backup_d" >&2
+        if [[ $(identify) != "$original" || $(value ActiveState) != inactive ]] ||
+           ! empty_runtime || ! unit_ok "$original"; then
+            say "旧設定または停止状態を確認できません。退避を保持: $backup_q $backup_d" >&2
             exit 1
         fi
-    fi
-    if (( rc != 0 && safe_stop && ! reboot_accepted )); then
-        if [[ $(value ActiveState) == inactive && $(identify) == "$original" ]] &&
-           empty_runtime && unit_ok "$original"; then
-            say 'GPU解放と旧設定を確認。旧モデルの起動を1回試みます。' >&2
-            systemctl --user start "$unit" || say '旧モデル起動失敗。再試行せず確認してください。' >&2
-        else
-            say '旧モデルの起動条件が不成立。停止状態を保って確認してください。' >&2
-        fi
+        say "旧設定 $original とunitの整合を確認しました。サービスは停止状態です。復旧前に状態を確認してください。" >&2
     fi
     for f in "$backup_q" "$backup_d" "$next_q" "$next_d"; do
         [[ -z "$f" ]] || rm -f -- "$f"
@@ -453,7 +443,7 @@ if [[ "$selected" == "$original" ]]; then
     exit 0
 fi
 if ! whiptail --title 'Reboot?' --defaultno --yesno \
-    "選択: $selected / $unit / API $(port "$selected")\nリクエストを終了し、モデルを変更してOSを再起動しますか？\n作業中のクライアントを終了してください。\nYes: idle確認→正常停止→GPU解放→設定対の切替→Reboot\nNo/Esc: 何も変更しません。" 16 78; then
+    "選択: $selected / $unit / API $(port "$selected")\nリクエストを終了し、モデルを変更してOSを再起動しますか？\n作業中のクライアントを終了してください。\nYes: idle確認→正常停止→コンテナ・ポート消失確認→設定対の切替→Reboot\nNo/Esc: 何も変更しません。" 16 78; then
     say 'No/取消: 変更なし。'
     exit 0
 fi
@@ -462,12 +452,9 @@ fi
 diagnostics=1
 phase=preflight
 say "切替開始: $original -> $selected"
-gtt_files=(/sys/class/drm/card*/device/mem_info_gtt_used)
-[[ ${#gtt_files[@]} == 1 && -r ${gtt_files[0]} ]] || fail 'GTT監視対象が一意でありません。'
-gtt_file=${gtt_files[0]}
-busy_file=${gtt_file%/*}/gpu_busy_percent
 preflight || fail '前提/idle/boot先/実効unitが不一致です。停止せず終了します。'
 say 'idle検査と新規HTTP到着の競合は完全には防げません。クライアント停止が前提です。'
+log_gpu_observation '停止前'
 # Recheck immediately before stop; do not wait/stop an externally replaced model.
 if ! running_idle "$original"; then
     say '直前idle確認失敗。モデルは停止しません。' >&2
@@ -475,9 +462,10 @@ if ! running_idle "$original"; then
 fi
 container_id=$(podman inspect "$(container_name "$original")" --format '{{.Id}}')
 stop_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-say "正常停止: $original / GTT before=$(gtt) bytes"
+say "正常停止: $original"
 phase=stop-command
 systemctl --user stop "$unit" || fail 'systemd停止失敗。設定変更・再起動を行いません。'
+log_gpu_observation '停止コマンド後'
 # --rm removes inspect state. Read the persisted event for this exact ID;
 # do not leave a background waiter holding the selector lock after an error.
 verify_stopped "$original" || fail "正常停止の全条件を確認できません（$phase）。設定変更・再起動を行いません。"
@@ -506,7 +494,7 @@ phase=verify-unit
 unit_ok "$selected" || fail '生成unit/停止設定/default.targetの整合性検査に失敗しました。'
 [[ $(value ActiveState) == inactive ]] && empty_runtime || fail '再起動直前にruntime状態が変化しました。'
 systemctl --user show "$unit" -p ExecStart -p ExecStop -p ExecStopPost -p Restart
-say "選択確認: $selected / API $(port "$selected")。正常停止とGPU解放済み。OSを再起動します。"
+say "選択確認: $selected / API $(port "$selected")。正常停止とコンテナ・ポート消失を確認しました。OSを再起動します。"
 sync -f "$quadlet"
 sync -f "$dropin"
 # A successful reboot disconnects SSH. Do not roll back in response to that HUP.
