@@ -3,7 +3,7 @@ Description=Halogen Flash-Next Uncensored r2 inference server
 ConditionPathIsMountPoint=/srv/llm
 
 [Container]
-Image=ghcr.io/peonist-ai/halogen-flash-server:0.18.4
+Image=ghcr.io/peonist-ai/halogen-flash-server:0.20.1
 Pull=never
 ContainerName=halogen-flash-uncensored
 Label=io.evox2.halogen.service=halogen-active
@@ -30,7 +30,7 @@ ExecStartPre=/usr/bin/bash -ec 'for file in qwen38-flash-next-ngram.hgn tokenize
 ExecStartPre=/usr/bin/bash -ec 'for node in /dev/kfd /dev/dri/renderD*; do test -r "$$node"; test -w "$$node"; done'
 ExecStartPre=/usr/bin/bash -ec 'test "$$(id -u)" -ne 0; test "$$(ulimit -S -l)" = unlimited; test "$$(ulimit -H -l)" = unlimited'
 ExecStartPre=/usr/bin/bash -ec 'test "$$(/usr/bin/podman info --format "{{.Host.Security.Rootless}}")" = true'
-ExecStartPre=/usr/bin/bash -ec 'test "$$(/usr/bin/podman image inspect ghcr.io/peonist-ai/halogen-flash-server:0.18.4 --format "{{.Id}}")" = 556c3c8179d8a566cc0ec0a7f7f54f9f3cb8b77e7bc4a4175e7c23ae359ad80a'
+ExecStartPre=/usr/bin/bash -ec 'test "$$(/usr/bin/podman image inspect ghcr.io/peonist-ai/halogen-flash-server:0.20.1 --format "{{.Id}}")" = b0973fd66e5aa886b54cfaf2e4ad976b8d56ad2a2640221beec8dc920ade6e37'
 # Refuse all running or stopped containers before Quadlet's generated --replace.
 ExecStartPre=/usr/bin/bash -ec 'existing=$$(/usr/bin/podman ps -a --format "{{.Names}}"); test -z "$$existing"'
 ExecStartPre=/usr/bin/bash -ec 'listeners=$$(/usr/bin/ss -H -ltn "( sport = :8731 or sport = :8732 or sport = :8733 )"); test -z "$$listeners"'

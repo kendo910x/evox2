@@ -34,9 +34,9 @@ qtemplate() { printf '%s/templates/%s/halogen-active.container' "$base" "$1"; }
 dtemplate() { printf '%s/templates/%s/halogen-active.service.d/90-safe-stop.conf' "$base" "$1"; }
 qhash() {
     case "$1" in
-        flash) echo cb6c6357066d68a0a7a8a035c8b61de8950ffa8847665b4bae23689c8ec03446 ;;
+        flash) echo 6e710807f64056d9d3fdbe128dc71279dda8ae039ed9e00f3c42f5ea60519ed4 ;;
         dense) echo 52a90d1a9ed70c95c84f42fd8edefa3cd293ef874ef7d048ed7d9166b67b9466 ;;
-        uncensored) echo 6d77e2191301343ccb0b417c662e370f7c91dc9cb1152ef9b5a678261a02288a ;;
+        uncensored) echo 7ec48f18e5de5fcba03f0e6b6f0e7f0e5fbef00295c420ea1b47fbd16806e607 ;;
         *) return 1 ;;
     esac
 }
@@ -50,14 +50,14 @@ dhash() {
 }
 image_id() {
     case "$1" in
-        flash|uncensored) echo 556c3c8179d8a566cc0ec0a7f7f54f9f3cb8b77e7bc4a4175e7c23ae359ad80a ;;
+        flash|uncensored) echo b0973fd66e5aa886b54cfaf2e4ad976b8d56ad2a2640221beec8dc920ade6e37 ;;
         dense) echo 7f87d073e63491e65fcdce6fb52c2faf2ded22229638f4ed2438096b11cb66c6 ;;
         *) return 1 ;;
     esac
 }
 image_name() {
     case "$1" in
-        flash|uncensored) echo ghcr.io/peonist-ai/halogen-flash-server:0.18.4 ;;
+        flash|uncensored) echo ghcr.io/peonist-ai/halogen-flash-server:0.20.1 ;;
         dense) echo ghcr.io/peonist-ai/halogen:0.1.4 ;;
         *) return 1 ;;
     esac
@@ -277,7 +277,7 @@ h=json.load(sys.stdin); m=sys.argv[1]
 assert h["status"] == "ok" and h["context"] == 262144
 assert m in ("flash", "dense", "uncensored") and h["model"] == sys.argv[2]
 assert h["busy"] is False and h["in_flight"] == 0 and h["queued"] == 0
-v="0.1.4" if m == "dense" else "0.18.4"
+v="0.1.4" if m == "dense" else "0.20.1"
 assert h["version"]["api"] == v and h["version"]["engine"] == v and h["version"]["match"] is True
 assert h["slots"] == (1 if m == "dense" else 4)
 assert h["drafter_default"] == ("dflash2" if m == "dense" else "mtp")
@@ -326,7 +326,8 @@ if m == "uncensored":
     done
     used=$(gtt) || return 1
     case "$model" in
-        flash|uncensored) expected_gtt=29085544448 ;;
+        flash) expected_gtt=29669548032 ;; # Measured idle after inference on 0.20.1.
+        uncensored) expected_gtt=29085544448 ;;
         dense) expected_gtt=21176967168 ;;
         *) return 1 ;;
     esac
